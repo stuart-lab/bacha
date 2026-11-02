@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bacha"
+version = "1.0.0"
+description = "Bias-adjusted chromatin accessibility scoring for single-cell ATAC-seq."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Tim Stuart", email = "stuartt@a-star.edu.sg" },
+    { name = "Ting Wei Lim", email = "Lim_Ting_Wei@a-star.edu.sg" },
+]
+keywords = ["bioinformatics", "single-cell", "ATAC-seq", "chromatin", "motif"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+    "anndata>=0.10",
+    "numpy>=1.24",
+    "pandas>=2.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "pytest-cov"]
+
+[project.urls]
+Homepage = "https://github.com/stuart-lab/bacha"
+Repository = "https://github.com/stuart-lab/bacha"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bacha"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

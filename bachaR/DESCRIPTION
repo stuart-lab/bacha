@@ -1,0 +1,34 @@
+Package: bacha
+Title: Bias adjusted aggregation of chromatin accessibility data
+Version: 1.0.0
+Authors@R: c(
+    person("Tim", "Stuart", , "stuartt@a-star.edu.sg", role = c("aut", "cre")),
+    person("Ting Wei", "Lim", , "Lim_Ting_Wei@a-star.edu.sg", role = c("aut"))
+    )
+Description: Bacha estimates the chromatin accessibility for a collection of sites in the genome (for example, transcription factor motif sites) and computes an accessibility score per cell normalized to a set of background control regions matched for GC content and sequence entropy by default.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+Depends:
+    R (>= 4.4.0)
+Imports:
+    BiocGenerics,
+    Biostrings,
+    data.table (>= 1.12.4),
+    GenomeInfoDb,
+    GenomicRanges,
+    hdf5r,
+    IRanges,
+    Matrix,
+    motifmatchr,
+    RANN,
+    S4Vectors,
+    stats,
+    SeuratObject,
+    Signac,
+    tools,
+    utils,
+    withr
+Suggests: 
+    Seurat
+Config/roxygen2/version: 8.1.0
