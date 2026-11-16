@@ -9,6 +9,8 @@ Bacha.default <- function(
     index,
     lambda = 10,
     pseudocount = 1,
+    shrink.to = c("zero", "mean"),
+    feature.names = c("name", "id"),
     threads = 6,
     check.bounds = TRUE,
     bacha.path = NULL,
@@ -17,6 +19,8 @@ Bacha.default <- function(
     verbose = TRUE,
     ...
   ) {
+  shrink.to <- match.arg(arg = shrink.to)
+  feature.names <- match.arg(arg = feature.names)
 
   # check fragment file exists
   if (!file.exists(object)) {
@@ -69,6 +73,8 @@ Bacha.default <- function(
       "-l", as.character(x = lambda),
       "-p", as.character(x = pseudocount),
       "-t", as.character(x = threads),
+      if (shrink.to != "zero") c("--shrink-to", shrink.to),
+      if (feature.names != "name") c("--feature-names", feature.names),
       if (!check.bounds) "--no-bounds-check"
     ),
     stdout = if (verbose) "" else FALSE,
@@ -327,6 +333,8 @@ bacha_multi <- function(
     index,
     lambda = 10,
     pseudocount = 1,
+    shrink.to = c("zero", "mean"),
+    feature.names = c("name", "id"),
     threads = 6,
     check.bounds = TRUE,
     bacha.path = NULL,
@@ -335,6 +343,8 @@ bacha_multi <- function(
     verbose = TRUE,
     ...
   ) {
+  shrink.to <- match.arg(arg = shrink.to)
+  feature.names <- match.arg(arg = feature.names)
 
   if (file.exists(outfile)) {
     stop("Requested output file already exists")
@@ -420,6 +430,8 @@ bacha_multi <- function(
       "-l", as.character(x = lambda),
       "-p", as.character(x = pseudocount),
       "-t", as.character(x = threads),
+      if (shrink.to != "zero") c("--shrink-to", shrink.to),
+      if (feature.names != "name") c("--feature-names", feature.names),
       if (!check.bounds) "--no-bounds-check"
     ),
     stdout = if (verbose) "" else FALSE,
@@ -463,7 +475,20 @@ Bacha.Assay5 <- function(object, ...) {
 #' precision-based shrinkage weight `prec / (prec + lambda)`, where
 #' `prec = (s + p)(c + p*r) / (s + c + p + p*r)` is the exposure-consistent
 #' posterior precision of the LFC under a Gamma(p, .) prior on each per-bp
-#' rate. Larger values give stronger shrinkage toward zero. Default: 10.
+#' rate. Larger values give stronger shrinkage toward the target set by
+#' \code{shrink.to}. Default: 10.
+#' @param shrink.to Where shrinkage pulls each score. \code{"zero"} (the
+#' default) is the posterior mean under a prior centred on no enrichment, so
+#' every score is pulled toward 0 by \code{1 - w}. \code{"mean"} centres the
+#' prior on each feature's pseudobulk log2 fold change, computed from the
+#' counts summed over every scored cell, giving
+#' \code{w * LFC + (1 - w) * mean}. Passed to bacha as \code{--shrink-to}.
+#' @param feature.names How to label each feature (row) of the score
+#' matrix. \code{"name"} (the default) uses the display name stored in the
+#' index, such as a TF gene symbol; features that share a name are each
+#' labelled \code{"NAME (ID)"} so that rows stay unique. \code{"id"} uses each
+#' feature's unique ID, such as a JASPAR matrix ID. Passed to bacha as
+#' \code{--feature-names}.
 #' @param pseudocount Numeric. Small constant added to counts before log fold
 #' change calculation to avoid \code{log(0)}. Shrinkage is handled by the
 #' precision weight, so this only needs to be a numerical guard. Default: 1.

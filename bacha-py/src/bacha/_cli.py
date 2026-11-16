@@ -48,6 +48,8 @@ def build_count_args(
     manifest: str | Path | None = None,
     lambda_: float = 10.0,
     pseudocount: float = 1.0,
+    shrink_to: str = "zero",
+    feature_names: str = "name",
     threads: int = 6,
     check_bounds: bool = True,
 ) -> list[str]:
@@ -60,6 +62,10 @@ def build_count_args(
     """
     # Flag order mirrors the R package exactly, so the two front ends invoke
     # the CLI identically.
+    if shrink_to not in ("zero", "mean"):
+        raise ValueError(f"shrink_to must be 'zero' or 'mean', got {shrink_to!r}")
+    if feature_names not in ("name", "id"):
+        raise ValueError(f"feature_names must be 'name' or 'id', got {feature_names!r}")
     if manifest is not None:
         if fragments is not None or cells_file is not None:
             raise ValueError("pass either manifest, or fragments + cells_file, not both")
@@ -77,6 +83,12 @@ def build_count_args(
         "-p", str(pseudocount),
         "-t", str(threads),
     ]
+    # Only passed when not the default, so the default invocation is identical
+    # to that of older versions (and of the R package).
+    if shrink_to != "zero":
+        args.extend(["--shrink-to", shrink_to])
+    if feature_names != "name":
+        args.extend(["--feature-names", feature_names])
     if not check_bounds:
         args.append("--no-bounds-check")
     return args

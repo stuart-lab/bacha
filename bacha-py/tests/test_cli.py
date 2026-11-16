@@ -144,3 +144,37 @@ def test_write_cells_file_uses_one_column_when_nothing_is_renamed(tmp_path: Path
 
     _count._write_cells_file(p, [("a", "s_a"), ("b", "s_b")])
     assert p.read_text() == "a\ts_a\nb\ts_b\n"
+
+
+def test_build_count_args_feature_names():
+    base = dict(
+        fragments="/data/frags.tsv.gz",
+        index="/idx/hg38.bi",
+        cells_file="/tmp/cells.txt",
+        outfile="/tmp/out.csv.gz",
+    )
+    assert "--feature-names" not in _cli.build_count_args(**base)
+    args = _cli.build_count_args(**base, feature_names="id")
+    assert args[-2:] == ["--feature-names", "id"]
+    with pytest.raises(ValueError):
+        _cli.build_count_args(**base, feature_names="symbol")
+
+
+def test_build_count_args_shrink_to_mean():
+    args = _cli.build_count_args(
+        fragments="/data/frags.tsv.gz",
+        index="/idx/hg38.bi",
+        cells_file="/tmp/cells.txt",
+        outfile="/tmp/out.csv.gz",
+        shrink_to="mean",
+        threads=4,
+    )
+    assert args[-2:] == ["--shrink-to", "mean"]
+    with pytest.raises(ValueError):
+        _cli.build_count_args(
+            fragments="/data/frags.tsv.gz",
+            index="/idx/hg38.bi",
+            cells_file="/tmp/cells.txt",
+            outfile="/tmp/out.csv.gz",
+            shrink_to="median",
+        )

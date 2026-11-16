@@ -34,7 +34,7 @@ use xz2::read::XzDecoder;
 #[derive(Clone, Copy)]
 struct ForwardRecord {
     local_idx: u32,
-    chrom_id: u8,
+    chrom_id: u32,
     start: u32,
     end: u32,
 }
@@ -186,6 +186,57 @@ fn report_skipped_lines(malformed: u64, total_lines: u64, unterminated_final_lin
     }
 }
 
+/// Where the precision-based shrinkage pulls a score toward.
+///
+/// `Zero` is centred on no enrichment. 
+//  `Mean` centres the prior on the feature's pseudobulk log fold
+/// change over every scored cell
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ShrinkTarget {
+    /// Shrink toward a log fold change of 0.
+    Zero,
+    /// Shrink toward the feature's pseudobulk log fold change over all
+    /// scored cells.
+    Mean,
+}
+
+/// Which label names each feature (row) of the score matrix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum FeatureNames {
+    /// The feature's display name (e.g. a gene symbol). A name shared by
+    /// several features gets the ID appended to each, as `NAME (ID)`, so
+    /// every row stays unique.
+    Name,
+    /// The feature's unique ID (e.g. a JASPAR matrix ID).
+    Id,
+}
+
+// Output labels for each feature. IDs are unique by construction (checked at
+// index load); names may repeat, so repeated names are qualified by the ID.
+fn feature_labels(ids: &[String], names: &[String], mode: FeatureNames) -> Vec<String> {
+    match mode {
+        FeatureNames::Id => ids.to_vec(),
+        FeatureNames::Name => {
+            let mut counts: FxHashMap<&str, usize> = FxHashMap::default();
+            for n in names {
+                *counts.entry(n.as_str()).or_default() += 1;
+            }
+            ids.iter()
+                .zip(names)
+                .map(|(id, n)| {
+                    if n.is_empty() {
+                        id.clone()
+                    } else if counts[n.as_str()] > 1 {
+                        format!("{n} ({id})")
+                    } else {
+                        n.clone()
+                    }
+                })
+                .collect()
+        }
+    }
+}
+
 // flat structure to store indices efficiently
 pub struct FlatIndVec {
     data: Vec<u32>,    // All indices concatenated
@@ -289,6 +340,8 @@ pub fn bacha(
     num_threads: usize,
     lambda: f32,
     pseudocount: f32,
+    shrink_to: ShrinkTarget,
+    feature_names: FeatureNames,
     check_bounds: bool,
 ) -> Result<(), Box<dyn Error>> {
     info!("Received fragment file: {:?}", frag_file);
@@ -319,6 +372,8 @@ pub fn bacha(
         num_threads,
         lambda,
         pseudocount,
+        shrink_to,
+        feature_names,
         check_bounds,
     )
 }
@@ -336,6 +391,8 @@ pub fn bacha_manifest(
     num_threads: usize,
     lambda: f32,
     pseudocount: f32,
+    shrink_to: ShrinkTarget,
+    feature_names: FeatureNames,
     check_bounds: bool,
 ) -> Result<(), Box<dyn Error>> {
     info!("Received manifest file: {:?}", manifest_file);
@@ -355,6 +412,8 @@ pub fn bacha_manifest(
         num_threads,
         lambda,
         pseudocount,
+        shrink_to,
+        feature_names,
         check_bounds,
     )
 }
@@ -390,6 +449,8 @@ fn bacha_sources(
     num_threads: usize,
     lambda: f32,
     pseudocount: f32,
+    shrink_to: ShrinkTarget,
+    feature_names: FeatureNames,
     check_bounds: bool,
 ) -> Result<(), Box<dyn Error>> {
     // Run everything inside a rayon pool sized to `num_threads`
@@ -409,6 +470,8 @@ fn bacha_sources(
             num_threads,
             lambda,
             pseudocount,
+            shrink_to,
+            feature_names,
             check_bounds,
         )
     })?;
@@ -804,9 +867,10 @@ struct IndexTables {
     control_indices: FlatIndVec,
     num_site_intervals: usize,
     tf_list: Vec<String>,
+    tf_names: Vec<String>,
     n_instances: Vec<u32>,
     chrom_names: Vec<String>,
-    chrom_to_id: FxHashMap<String, u8>,
+    chrom_to_id: FxHashMap<String, u32>,
     chrom_size_by_id: Vec<u32>,
     n_features: usize,
 }
@@ -825,6 +889,7 @@ fn load_index_tables(
         control_indices,
         num_site_intervals,
         tf_list,
+        tf_names,
         n_instances,
         chrom_sizes,
     ) = match parse_file_to_lapper(index_file, num_threads) {
@@ -858,20 +923,10 @@ fn load_index_tables(
         interval_free.sort();
         chrom_names.extend(interval_free);
     }
-    if chrom_names.len() > u8::MAX as usize + 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Index contains {} chromosomes; the maximum supported is {}.",
-                chrom_names.len(),
-                u8::MAX as usize + 1
-            ),
-        ));
-    }
-    let chrom_to_id: FxHashMap<String, u8> = chrom_names
+    let chrom_to_id: FxHashMap<String, u32> = chrom_names
         .iter()
         .enumerate()
-        .map(|(i, name)| (name.clone(), i as u8))
+        .map(|(i, name)| (name.clone(), i as u32))
         .collect();
 
     // Build chromosome size lookup by chrom_id for the genome/assembly bounds
@@ -896,6 +951,7 @@ fn load_index_tables(
         control_indices,
         num_site_intervals,
         tf_list,
+        tf_names,
         n_instances,
         chrom_names,
         chrom_to_id,
@@ -1011,6 +1067,8 @@ fn run_count(
     num_threads: usize,
     lambda: f32,
     pseudocount: f32,
+    shrink_to: ShrinkTarget,
+    feature_names: FeatureNames,
     check_bounds: bool,
 ) -> io::Result<()> {
     let (count_matrix, cell_order, tables) =
@@ -1023,10 +1081,11 @@ fn run_count(
         output_path,
         b',',
         &cell_order,
-        &tables.tf_list,
+        &feature_labels(&tables.tf_list, &tables.tf_names, feature_names),
         num_threads,
         lambda,
         pseudocount,
+        shrink_to,
     )?;
     if std::env::var("BACHA_PROFILE").is_ok() {
         eprintln!(
@@ -1133,7 +1192,7 @@ fn count_one_file(
         let mut reader = BufReader::with_capacity(8 * 1024 * 1024, MultiGzDecoder::new(file));
 
         let mut line_buf: Vec<u8> = Vec::with_capacity(256);
-        let mut current_chrom_id: Option<u8> = None;
+        let mut current_chrom_id: Option<u32> = None;
         let mut current_lapper: Option<&Lapper<u32, u32>> = None;
         let mut total_fragments: u64 = 0;
         let mut matched_cells: u64 = 0;
@@ -1475,7 +1534,7 @@ fn count_one_file(
                     let mut since_progress_flush: u64 = 0;
                     let mut recv_block_total = std::time::Duration::ZERO;
                     let worker_t0 = Instant::now();
-                    let mut cached_chrom_id: Option<u8> = None;
+                    let mut cached_chrom_id: Option<u32> = None;
                     let mut cached_lapper: Option<&Lapper<u32, u32>> = None;
 
                     // Write one fragment's two endpoint counts into the
@@ -1484,7 +1543,7 @@ fn count_one_file(
                     // forwarded-batch drain hits less but the lookup is
                     // a cheap FxHashMap get on miss).
                     let mut apply =
-                        |chrom_id: u8,
+                        |chrom_id: u32,
                          start: u32,
                          end: u32,
                          local_idx: usize,
@@ -1847,6 +1906,7 @@ pub fn compute_and_write_scores(
     num_threads: usize,
     lambda: f32,
     pseudocount: f32,
+    shrink_to: ShrinkTarget,
 ) -> io::Result<()> {
     validate_thread_count(num_threads)?;
     validate_scoring_parameters(lambda, pseudocount)?;
@@ -1923,6 +1983,48 @@ pub fn compute_and_write_scores(
     // shrinkage weight is
     //     w = prec / (prec + 1/sigma^2)
     // and we parameterise the prior precision as `lambda` directly.
+    //
+    // The prior is centred on `target`, so the posterior mean is
+    //     score = w * LFC + (1 - w) * target.
+    // With `ShrinkTarget::Zero` the target is 0 and this is plain `w * LFC`.
+    // With `ShrinkTarget::Mean` the target is the feature's pseudobulk LFC.
+    let targets: Vec<f32> = match shrink_to {
+        ShrinkTarget::Zero => vec![0.0; nsites],
+        ShrinkTarget::Mean => (0..nsites)
+            .map(|i| match site_ratios[i] {
+                None => 0.0,
+                Some(r) => {
+                    let s: f64 = count_matrix.column(i).iter().map(|&v| v as f64).sum();
+                    let c: f64 = count_matrix
+                        .column(nsites + i)
+                        .iter()
+                        .map(|&v| v as f64)
+                        .sum();
+                    let p = pseudocount as f64;
+                    ((s + p) / (c / r as f64 + p)).log2() as f32
+                }
+            })
+            .collect(),
+    };
+    if shrink_to == ShrinkTarget::Mean {
+        let mut sorted: Vec<f32> = targets
+            .iter()
+            .zip(site_ratios.iter())
+            .filter(|(_, r)| r.is_some())
+            .map(|(t, _)| *t)
+            .collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        if !sorted.is_empty() {
+            let median = sorted[sorted.len() / 2];
+            eprintln!(
+                "Shrinking toward each feature's pseudobulk log2 fold change \
+                 (range {:.3} to {:.3}, median {:.3})",
+                sorted[0],
+                sorted[sorted.len() - 1],
+                median
+            );
+        }
+    }
 
     // Build feature rows in parallel chunks. Buffering every row at once
     // would cost ~n_features × n_cells × 8 bytes (~500 MB for 800 TFs and
@@ -1940,6 +2042,7 @@ pub fn compute_and_write_scores(
                     ncells,
                     count_matrix,
                     site_ratios[i],
+                    targets[i],
                     tf_list[i].as_bytes(),
                     delimiter,
                     lambda,
@@ -1984,6 +2087,7 @@ fn build_score_row(
     ncells: usize,
     count_matrix: &Array2<u32>,
     site_ratio: Option<f32>,
+    target: f32,
     tf_name: &[u8],
     delimiter: u8,
     lambda: f32,
@@ -2026,7 +2130,8 @@ fn build_score_row(
                 let weight = prec / (prec + lambda);
 
                 buf.push(delimiter);
-                let _ = write!(ByteWriter(&mut buf), "{:.3}", weight * raw_lfc);
+                let score = weight * raw_lfc + (1.0 - weight) * target;
+                let _ = write!(ByteWriter(&mut buf), "{:.3}", score);
             }
         }
     }
@@ -2065,7 +2170,8 @@ type IndexData = (
     Vec<u32>,                            // site_indices (1:1 with site intervals)
     FlatIndVec,                          // control_indices (variable per control interval)
     usize,                               // num_site_intervals (to distinguish sites from controls)
-    Vec<String>,                         // tf_list
+    Vec<String>,                         // tf_list (feature IDs)
+    Vec<String>,                         // feature display names
     Vec<u32>,                            // n_instances
     FxHashMap<String, u32>,              // chromosome_sizes
 );
@@ -2121,71 +2227,230 @@ fn open_index_decompressed(index_file: &Path, bgzf_workers: usize) -> io::Result
     }
 }
 
-// In-place inverse of per-chromosome delta encoding for u32 LE start arrays.
-// Recovers absolute starts via a cumulative sum that resets at every change
-// of chromosome id.
-fn cumsum_per_chrom_in_place(buf: &mut [u8], chrom_ids: &[u8]) {
-    let n = chrom_ids.len();
-    if n == 0 {
-        return;
-    }
-    let mut acc: u32 = 0;
-    let mut prev_chrom: i32 = -1;
-    for i in 0..n {
-        let chrom = chrom_ids[i] as i32;
-        let off = i * 4;
-        let val = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
-        if chrom != prev_chrom {
-            acc = val;
-        } else {
-            acc = acc.wrapping_add(val);
-        }
-        let bytes = acc.to_le_bytes();
-        buf[off] = bytes[0];
-        buf[off + 1] = bytes[1];
-        buf[off + 2] = bytes[2];
-        buf[off + 3] = bytes[3];
-        prev_chrom = chrom;
-    }
+fn read_u32_le(r: &mut impl Read) -> io::Result<u32> {
+    let mut buf = [0u8; 4];
+    r.read_exact(&mut buf)?;
+    Ok(u32::from_le_bytes(buf))
 }
 
-// In-place inverse of within-row delta encoding for the flattened u16 LE
-// control TF index stream. Recovers absolute indices via a cumulative sum
-// that resets at every row boundary defined by `n_per_row`.
-fn cumsum_within_row_u16_in_place(buf: &mut [u8], n_per_row: &[usize]) {
-    let mut tf_cursor: usize = 0;
-    for &n_idx in n_per_row {
-        let mut acc: u16 = 0;
-        for j in 0..n_idx {
-            let off = (tf_cursor + j) * 2;
-            let val = u16::from_le_bytes([buf[off], buf[off + 1]]);
-            if j == 0 {
-                acc = val;
-            } else {
-                acc = acc.wrapping_add(val);
+fn malformed_index(msg: String) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("Malformed index: {msg}"),
+    )
+}
+
+// Read one varint column (see the format docs on `BachaIndex`): a u64 LE byte
+// length, then exactly that many bytes holding `n` unsigned LEB128 values of
+// at most 32 bits. `f` receives each value in order. The column is decoded
+// through a small buffer, so the encoded bytes are never held in full.
+fn read_varint_column(
+    r: &mut impl Read,
+    n: usize,
+    what: &str,
+    mut f: impl FnMut(u32) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut len = [0u8; 8];
+    r.read_exact(&mut len)?;
+    let byte_len = u64::from_le_bytes(len);
+    // Each value takes 1 to 5 bytes.
+    if byte_len < n as u64 || byte_len > 5 * n as u64 {
+        return Err(malformed_index(format!(
+            "{what} column is {byte_len} bytes long, which cannot hold {n} values"
+        )));
+    }
+    let mut remaining = byte_len;
+    let mut buf = vec![0u8; byte_len.min(1 << 16) as usize];
+    let (mut pos, mut end) = (0usize, 0usize);
+    let (mut value, mut shift) = (0u32, 0u32);
+    let mut decoded = 0usize;
+    while decoded < n {
+        if pos == end {
+            if remaining == 0 {
+                return Err(malformed_index(format!(
+                    "{what} column ends after {decoded} of {n} values"
+                )));
             }
-            let bytes = acc.to_le_bytes();
-            buf[off] = bytes[0];
-            buf[off + 1] = bytes[1];
+            end = remaining.min(buf.len() as u64) as usize;
+            r.read_exact(&mut buf[..end])?;
+            remaining -= end as u64;
+            pos = 0;
         }
-        tf_cursor += n_idx;
+        let byte = buf[pos];
+        pos += 1;
+        // A fifth byte may carry only the top 4 bits of a u32, and no
+        // continuation bit.
+        if shift == 28 && byte > 0x0f {
+            return Err(malformed_index(format!(
+                "{what} column holds a value wider than 32 bits"
+            )));
+        }
+        value |= u32::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            f(value)?;
+            decoded += 1;
+            value = 0;
+            shift = 0;
+        } else {
+            shift += 7;
+        }
     }
-}
-
-// Verify every chromosome ID in a columnar block addresses a row of the
-// index's chromosome table. IDs are used as direct vector indices, so an
-// out-of-range value in a corrupt file must be an error, not a panic.
-fn check_chrom_ids(chrom_ids: &[u8], n_chroms: usize, what: &str) -> io::Result<()> {
-    if let Some(&bad) = chrom_ids.iter().find(|&&c| c as usize >= n_chroms) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Malformed index: {what} chromosome ID {bad} is outside the chromosome \
-                 table (which has {n_chroms} entries)"
-            ),
-        ));
+    let left = (end - pos) as u64 + remaining;
+    if left != 0 {
+        return Err(malformed_index(format!(
+            "{what} column has {left} byte(s) left after its last value"
+        )));
     }
     Ok(())
+}
+
+// A position block's chromosome column, as runs of consecutive rows on one
+// chromosome: (chromosome ID, row count). Rows are sorted by chromosome, so
+// this holds one entry per chromosome rather than one per row.
+//
+// IDs index the chromosome table directly, so an out-of-range ID in a corrupt
+// file must be an error, not a panic.
+fn read_chrom_runs(
+    r: &mut impl Read,
+    n: usize,
+    n_chroms: usize,
+    what: &str,
+) -> io::Result<Vec<(u32, usize)>> {
+    let mut runs: Vec<(u32, usize)> = Vec::new();
+    read_varint_column(r, n, &format!("{what} chromosome"), |c| {
+        if c as usize >= n_chroms {
+            return Err(malformed_index(format!(
+                "{what} chromosome ID {c} is outside the chromosome table \
+                 (which has {n_chroms} entries)"
+            )));
+        }
+        match runs.last_mut() {
+            Some((last, count)) if *last == c => *count += 1,
+            _ => runs.push((c, 1)),
+        }
+        Ok(())
+    })?;
+    Ok(runs)
+}
+
+// Read a start column, delta-encoded within each chromosome run, as absolute
+// 1-based starts: the first start of a run is absolute and each later one is
+// the difference from the previous start.
+fn read_starts(r: &mut impl Read, runs: &[(u32, usize)], what: &str) -> io::Result<Vec<u32>> {
+    let n: usize = runs.iter().map(|&(_, k)| k).sum();
+    let mut starts = Vec::with_capacity(n);
+    let mut run = 0usize;
+    let mut left_in_run = runs.first().map_or(0, |&(_, k)| k);
+    let mut acc: u32 = 0;
+    read_varint_column(r, n, &format!("{what} start"), |d| {
+        if left_in_run == 0 {
+            run += 1;
+            left_in_run = runs[run].1;
+            acc = 0;
+        }
+        left_in_run -= 1;
+        acc = acc
+            .checked_add(d)
+            .ok_or_else(|| malformed_index(format!("{what} start position overflows 32 bits")))?;
+        starts.push(acc);
+        Ok(())
+    })?;
+    Ok(starts)
+}
+
+// Site positions block: rows sorted by chromosome then start, each carrying a
+// 1-based feature index.
+struct SiteBlock {
+    chrom_runs: Vec<(u32, usize)>,
+    starts: Vec<u32>,
+    features: Vec<u32>,
+}
+
+fn read_site_block(r: &mut impl Read, n_chroms: usize) -> io::Result<SiteBlock> {
+    let n = read_u32_le(r)? as usize;
+    let chrom_runs = read_chrom_runs(r, n, n_chroms, "site")?;
+    let starts = read_starts(r, &chrom_runs, "site")?;
+    let mut features = Vec::with_capacity(n);
+    read_varint_column(r, n, "site feature index", |v| {
+        features.push(v);
+        Ok(())
+    })?;
+    Ok(SiteBlock {
+        chrom_runs,
+        starts,
+        features,
+    })
+}
+
+// Control positions block: rows sorted by chromosome then start, each carrying
+// a list of feature indices. Row `i`'s indices are
+// `features[offsets[i]..offsets[i + 1]]`.
+struct ControlBlock {
+    chrom_runs: Vec<(u32, usize)>,
+    starts: Vec<u32>,
+    offsets: Vec<u32>,
+    features: Vec<u32>,
+}
+
+fn read_control_block(r: &mut impl Read, n_chroms: usize) -> io::Result<ControlBlock> {
+    let n = read_u32_le(r)? as usize;
+    let chrom_runs = read_chrom_runs(r, n, n_chroms, "control")?;
+    let starts = read_starts(r, &chrom_runs, "control")?;
+
+    let mut offsets: Vec<u32> = Vec::with_capacity(n + 1);
+    offsets.push(0);
+    let mut total: u64 = 0;
+    read_varint_column(r, n, "control row length", |k| {
+        total += u64::from(k);
+        let end = u32::try_from(total).map_err(|_| {
+            malformed_index("control rows hold more than 2^32 feature indices".to_string())
+        })?;
+        offsets.push(end);
+        Ok(())
+    })?;
+    // The per-row lengths and the stated total are independent fields; the
+    // feature column below is sized by the total and walked by the rows.
+    let stated_total = read_u32_le(r)?;
+    if total != u64::from(stated_total) {
+        return Err(malformed_index(format!(
+            "control rows declare {total} feature index/indices in total but the \
+             index states {stated_total}"
+        )));
+    }
+
+    // Feature indices are delta-encoded within each row: the first index of
+    // a row is absolute, later ones are differences from the previous index.
+    let total = stated_total as usize;
+    let mut features: Vec<u32> = Vec::with_capacity(total);
+    let mut next_row = 0usize;
+    let mut acc: u32 = 0;
+    read_varint_column(r, total, "control feature index", |d| {
+        let i = features.len() as u32;
+        if next_row < n && offsets[next_row] == i {
+            // Step past every row starting here; empty rows share a start.
+            while next_row < n && offsets[next_row] == i {
+                next_row += 1;
+            }
+            acc = d;
+        } else {
+            acc = acc.checked_add(d).ok_or_else(|| {
+                malformed_index("control feature index overflows 32 bits".to_string())
+            })?;
+        }
+        features.push(acc);
+        Ok(())
+    })?;
+    Ok(ControlBlock {
+        chrom_runs,
+        starts,
+        offsets,
+        features,
+    })
+}
+
+// Expand chromosome runs to one chromosome ID per row.
+fn run_chroms(runs: &[(u32, usize)]) -> impl Iterator<Item = u32> + '_ {
+    runs.iter().flat_map(|&(c, k)| std::iter::repeat_n(c, k))
 }
 
 fn one_based_start_to_zero_based(start: u32) -> io::Result<u32> {
@@ -2194,6 +2459,190 @@ fn one_based_start_to_zero_based(start: u32) -> io::Result<u32> {
             io::ErrorKind::InvalidData,
             "Index coordinates are 1-based; start position must be >= 1",
         )
+    })
+}
+
+// The only binary index format version. Bump it when the layout changes.
+const INDEX_VERSION: u8 = 1;
+
+fn check_index_version(version: u8) -> io::Result<()> {
+    if version != INDEX_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Unsupported binary index version: {version} (expected {INDEX_VERSION})"),
+        ));
+    }
+    Ok(())
+}
+
+// Read the build provenance block that follows the fixed header fields: a u16
+// entry count followed by that many (key, value) pairs of u16-length-prefixed
+// UTF-8 strings. The count may be zero.
+fn read_build_metadata(reader: &mut impl Read) -> io::Result<Vec<(String, String)>> {
+    fn read_string(r: &mut impl Read) -> io::Result<String> {
+        let mut len = [0u8; 2];
+        r.read_exact(&mut len)?;
+        let mut buf = vec![0u8; u16::from_le_bytes(len) as usize];
+        r.read_exact(&mut buf)?;
+        String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+    let mut n = [0u8; 2];
+    reader.read_exact(&mut n)?;
+    let n = u16::from_le_bytes(n) as usize;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let key = read_string(reader)?;
+        let value = read_string(reader)?;
+        out.push((key, value));
+    }
+    Ok(out)
+}
+
+// Motif matrix value types, as stored in the matrix section of the index.
+const MATRIX_NONE: u8 = 0;
+const MATRIX_KINDS: [&str; 5] = ["none", "counts", "probabilities", "logodds", "other"];
+
+/// A feature's motif matrix: `width` positions of A, C, G, T values, stored
+/// position-major (`values[4 * pos + base]`).
+pub struct FeatureMatrix {
+    kind: u8,
+    width: usize,
+    values: Vec<f32>,
+}
+
+/// Everything in a binary index ahead of the site position block.
+struct IndexHeader {
+    version: u8,
+    genome: String,
+    motif_set: String,
+    window: u32,
+    build: Vec<(String, String)>,
+    ids: Vec<String>,
+    names: Vec<String>,
+    // per-feature site counts followed by per-feature control counts
+    n_instances: Vec<u32>,
+    chroms: Vec<(String, u32)>,
+    // one entry per feature, or empty when the index stores no matrices
+    matrices: Vec<Option<FeatureMatrix>>,
+}
+
+// Read the header, from the version byte (the magic has already been
+// consumed) up to the start of the site positions.
+fn read_index_header(r: &mut impl Read) -> io::Result<IndexHeader> {
+    fn u8_(r: &mut impl Read) -> io::Result<u8> {
+        let mut b = [0u8; 1];
+        r.read_exact(&mut b)?;
+        Ok(b[0])
+    }
+    fn u16_(r: &mut impl Read) -> io::Result<u16> {
+        let mut b = [0u8; 2];
+        r.read_exact(&mut b)?;
+        Ok(u16::from_le_bytes(b))
+    }
+    fn u32_(r: &mut impl Read) -> io::Result<u32> {
+        let mut b = [0u8; 4];
+        r.read_exact(&mut b)?;
+        Ok(u32::from_le_bytes(b))
+    }
+    fn string(r: &mut impl Read) -> io::Result<String> {
+        let mut buf = vec![0u8; u16_(r)? as usize];
+        r.read_exact(&mut buf)?;
+        String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+    let malformed = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
+
+    let version = u8_(r)?;
+    check_index_version(version)?;
+    let genome = string(r)?;
+    let motif_set = string(r)?;
+    let window = u32_(r)?;
+    let n_tfs = u32_(r)? as usize;
+    // Control feature indices are stored as `tf_index + n_tfs`, so 2 * n_tfs
+    // must fit in a u32.
+    if n_tfs > (u32::MAX / 2) as usize {
+        return Err(malformed(format!(
+            "Malformed index: feature count {n_tfs} is too large"
+        )));
+    }
+    let n_chroms = u32_(r)? as usize;
+    let build = read_build_metadata(r)?;
+
+    // Feature table: a unique ID and a display name per feature. Capacities
+    // are capped because the counts come from the file and may be corrupt.
+    let mut ids = Vec::with_capacity(n_tfs.min(1 << 16));
+    let mut names = Vec::with_capacity(n_tfs.min(1 << 16));
+    for _ in 0..n_tfs {
+        ids.push(string(r)?);
+        names.push(string(r)?);
+    }
+
+    let mut n_instances = Vec::with_capacity((n_tfs * 2).min(1 << 17));
+    for _ in 0..(n_tfs * 2) {
+        n_instances.push(u32_(r)?);
+    }
+
+    let mut chroms = Vec::with_capacity(n_chroms.min(1 << 16));
+    for _ in 0..n_chroms {
+        let name = string(r)?;
+        chroms.push((name, u32_(r)?));
+    }
+
+    // Matrix section: a presence flag, then per feature a value type, a
+    // width and width x 4 f32 values. A feature without a matrix has type
+    // MATRIX_NONE and width 0.
+    let mut matrices = Vec::new();
+    match u8_(r)? {
+        0 => {}
+        1 => {
+            matrices.reserve(ids.len());
+            for id in &ids {
+                let kind = u8_(r)?;
+                let width = u16_(r)? as usize;
+                if kind as usize >= MATRIX_KINDS.len() {
+                    return Err(malformed(format!(
+                        "Malformed index: unknown matrix type {kind} for feature {id}"
+                    )));
+                }
+                if kind == MATRIX_NONE {
+                    if width != 0 {
+                        return Err(malformed(format!(
+                            "Malformed index: feature {id} has no matrix but a width of {width}"
+                        )));
+                    }
+                    matrices.push(None);
+                    continue;
+                }
+                let mut raw = vec![0u8; width * 16];
+                r.read_exact(&mut raw)?;
+                let values = raw
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                matrices.push(Some(FeatureMatrix {
+                    kind,
+                    width,
+                    values,
+                }));
+            }
+        }
+        flag => {
+            return Err(malformed(format!(
+                "Malformed index: matrix section flag is {flag} (expected 0 or 1)"
+            )));
+        }
+    }
+
+    Ok(IndexHeader {
+        version,
+        genome,
+        motif_set,
+        window,
+        build,
+        ids,
+        names,
+        n_instances,
+        chroms,
+        matrices,
     })
 }
 
@@ -2226,96 +2675,103 @@ pub fn view_index(index_file: &Path, header_only: bool) -> io::Result<()> {
         bgzf_worker_count(DEFAULT_BGZF_WORKERS),
     )?);
     read_magic(&mut reader)?;
-    view_binary_index(&mut reader, header_only)
-}
-
-fn view_binary_index(reader: &mut impl Read, header_only: bool) -> io::Result<()> {
-    fn read_u8(r: &mut impl Read) -> io::Result<u8> {
-        let mut buf = [0u8; 1];
-        r.read_exact(&mut buf)?;
-        Ok(buf[0])
-    }
-    fn read_u16_le(r: &mut impl Read) -> io::Result<u16> {
-        let mut buf = [0u8; 2];
-        r.read_exact(&mut buf)?;
-        Ok(u16::from_le_bytes(buf))
-    }
-    fn read_u32_le(r: &mut impl Read) -> io::Result<u32> {
-        let mut buf = [0u8; 4];
-        r.read_exact(&mut buf)?;
-        Ok(u32::from_le_bytes(buf))
-    }
-    fn read_string(r: &mut impl Read) -> io::Result<String> {
-        let len = read_u16_le(r)? as usize;
-        let mut buf = vec![0u8; len];
-        r.read_exact(&mut buf)?;
-        String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
-
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
+    view_binary_index(&mut reader, header_only, &mut out)
+}
 
-    let version = read_u8(reader)?;
-    if version != 1 {
+/// Write the motif matrices stored in an index in JASPAR format, one record
+/// per feature that has a matrix. The header line carries the feature ID, its
+/// display name and the matrix value type, tab-separated:
+///
+/// ```text
+/// >MA0004.1\tArnt\tcounts
+/// A  [ 4 19 0 ... ]
+/// C  [ 16 0 20 ... ]
+/// G  [ ... ]
+/// T  [ ... ]
+/// ```
+pub fn write_index_motifs(index_file: &Path, out: &mut impl Write) -> io::Result<()> {
+    let mut reader = BufReader::new(open_index_decompressed(
+        index_file,
+        bgzf_worker_count(DEFAULT_BGZF_WORKERS),
+    )?);
+    read_magic(&mut reader)?;
+    let h = read_index_header(&mut reader)?;
+    if h.matrices.iter().all(|m| m.is_none()) {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Unsupported binary index version: {version} (expected 1)"),
+            io::ErrorKind::NotFound,
+            "Index stores no motif matrices (it may have been built from positions \
+             rather than PWMs)",
         ));
     }
-    let genome_name = read_string(reader)?;
-    let motif_set = read_string(reader)?;
-    let window = read_u32_le(reader)?;
-    let n_tfs = read_u16_le(reader)? as usize;
-    let n_chroms = read_u8(reader)? as usize;
+    for ((id, name), m) in h.ids.iter().zip(&h.names).zip(&h.matrices) {
+        let Some(m) = m else { continue };
+        writeln!(out, ">{}\t{}\t{}", id, name, MATRIX_KINDS[m.kind as usize])?;
+        for (b, base) in ["A", "C", "G", "T"].iter().enumerate() {
+            write!(out, "{base}  [")?;
+            for pos in 0..m.width {
+                write!(out, " {}", m.values[4 * pos + b])?;
+            }
+            writeln!(out, " ]")?;
+        }
+    }
+    out.flush()
+}
 
-    writeln!(out, "## format: binary v{}", version)?;
-    writeln!(out, "## genome: {}", genome_name)?;
-    writeln!(out, "## motif set: {}", motif_set)?;
-    writeln!(out, "## window: {}", window)?;
+fn view_binary_index(
+    reader: &mut impl Read,
+    header_only: bool,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    let h = read_index_header(reader)?;
+    let n_tfs = h.ids.len();
+    let n_matrices = h.matrices.iter().filter(|m| m.is_some()).count();
 
-    // TF names
-    let mut tf_names = Vec::with_capacity(n_tfs);
-    for _ in 0..n_tfs {
-        tf_names.push(read_string(reader)?);
+    writeln!(out, "## format: binary v{}", h.version)?;
+    writeln!(out, "## genome: {}", h.genome)?;
+    writeln!(out, "## motif set: {}", h.motif_set)?;
+    writeln!(out, "## window: {}", h.window)?;
+    writeln!(out, "## matrices: {}", n_matrices)?;
+
+    // Build provenance and the feature table. Printed before the chromosome
+    // table so parsers that only act on the sections they know skip them.
+    if !h.build.is_empty() {
+        writeln!(out, "##[build]")?;
+        for (key, value) in &h.build {
+            writeln!(out, "{}\t{}", key, value)?;
+        }
+    }
+    writeln!(out, "##[features]")?;
+    writeln!(out, "# id\tname")?;
+    for (id, name) in h.ids.iter().zip(&h.names) {
+        writeln!(out, "{}\t{}", id, name)?;
     }
 
-    // Instance counts
-    let mut site_counts = Vec::with_capacity(n_tfs);
-    for _ in 0..n_tfs {
-        site_counts.push(read_u32_le(reader)?);
-    }
-    let mut control_counts = Vec::with_capacity(n_tfs);
-    for _ in 0..n_tfs {
-        control_counts.push(read_u32_le(reader)?);
-    }
-
-    // Chromosome table
-    let mut chrom_names = Vec::with_capacity(n_chroms);
-    let mut chrom_sizes = Vec::with_capacity(n_chroms);
-    for _ in 0..n_chroms {
-        chrom_names.push(read_string(reader)?);
-        chrom_sizes.push(read_u32_le(reader)?);
-    }
-
-    // Print chromosome sizes
     writeln!(out, "##[chromosome sizes]")?;
-    for (name, size) in chrom_names.iter().zip(chrom_sizes.iter()) {
+    for (name, size) in &h.chroms {
         writeln!(out, "{}\t{}", name, size)?;
     }
 
-    // Print sites header
     writeln!(out, "##[sites]")?;
     writeln!(out, "# id\tindex\tcount")?;
-    for (i, name) in tf_names.iter().enumerate() {
-        writeln!(out, "{}\t{}\t{}", name, i + 1, site_counts[i])?;
+    for (i, id) in h.ids.iter().enumerate() {
+        writeln!(out, "{}\t{}\t{}", id, i + 1, h.n_instances[i])?;
     }
 
-    // Print controls header
     writeln!(out, "##[controls]")?;
     writeln!(out, "# id\tindex\tcount")?;
-    for (i, name) in tf_names.iter().enumerate() {
-        writeln!(out, "{}\t{}\t{}", name, n_tfs + i + 1, control_counts[i])?;
+    for (i, id) in h.ids.iter().enumerate() {
+        writeln!(
+            out,
+            "{}\t{}\t{}",
+            id,
+            n_tfs + i + 1,
+            h.n_instances[n_tfs + i]
+        )?;
     }
+    let chrom_names: Vec<String> = h.chroms.into_iter().map(|(n, _)| n).collect();
+    let window = h.window;
 
     if header_only {
         return Ok(());
@@ -2340,36 +2796,24 @@ fn view_binary_index(reader: &mut impl Read, header_only: bool) -> io::Result<()
     }
 
     // Site positions
-    let n_sites = read_u32_le(reader)? as usize;
-    let mut site_chrom_ids = vec![0u8; n_sites];
-    reader.read_exact(&mut site_chrom_ids)?;
-    check_chrom_ids(&site_chrom_ids, chrom_names.len(), "site")?;
-    let mut site_starts_buf = vec![0u8; n_sites * 4];
-    reader.read_exact(&mut site_starts_buf)?;
-    let mut site_tf_buf = vec![0u8; n_sites * 2];
-    reader.read_exact(&mut site_tf_buf)?;
-    cumsum_per_chrom_in_place(&mut site_starts_buf, &site_chrom_ids);
+    let sites = read_site_block(reader, chrom_names.len())?;
 
     writeln!(out, "##[site positions]")?;
     writeln!(out, "# chrom\tstart\tend\tindex")?;
-    for i in 0..n_sites {
-        let chrom = &chrom_names[site_chrom_ids[i] as usize];
-        let start = u32::from_le_bytes([
-            site_starts_buf[i * 4],
-            site_starts_buf[i * 4 + 1],
-            site_starts_buf[i * 4 + 2],
-            site_starts_buf[i * 4 + 3],
-        ]);
-        let tf_idx = u16::from_le_bytes([site_tf_buf[i * 2], site_tf_buf[i * 2 + 1]]);
+    for ((chrom_id, &start), &tf_idx) in run_chroms(&sites.chrom_runs)
+        .zip(&sites.starts)
+        .zip(&sites.features)
+    {
         writeln!(
             out,
             "{}\t{}\t{}\t{}",
-            chrom,
+            chrom_names[chrom_id as usize],
             start,
             start + window - 1,
             tf_idx
         )?;
     }
+    drop(sites);
 
     // Flush before next bulk read
     out.flush()?;
@@ -2388,66 +2832,28 @@ fn view_binary_index(reader: &mut impl Read, header_only: bool) -> io::Result<()
     }
 
     // Control positions
-    let n_controls = read_u32_le(reader)? as usize;
-    let mut ctrl_chrom_ids = vec![0u8; n_controls];
-    reader.read_exact(&mut ctrl_chrom_ids)?;
-    check_chrom_ids(&ctrl_chrom_ids, chrom_names.len(), "control")?;
-    let mut ctrl_starts_buf = vec![0u8; n_controls * 4];
-    reader.read_exact(&mut ctrl_starts_buf)?;
-    cumsum_per_chrom_in_place(&mut ctrl_starts_buf, &ctrl_chrom_ids);
-    let n_per_row: Vec<usize> = {
-        let mut buf = vec![0u8; n_controls * 2];
-        reader.read_exact(&mut buf)?;
-        (0..n_controls)
-            .map(|i| u16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]) as usize)
-            .collect()
-    };
-    let total_ctrl_indices = read_u32_le(reader)? as usize;
-    let n_per_row_total: usize = n_per_row.iter().sum();
-    if n_per_row_total != total_ctrl_indices {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Malformed index: control rows declare {n_per_row_total} feature index/indices \
-                 in total but the index states {total_ctrl_indices}"
-            ),
-        ));
-    }
-    let mut ctrl_tf_buf = vec![0u8; total_ctrl_indices * 2];
-    reader.read_exact(&mut ctrl_tf_buf)?;
-    cumsum_within_row_u16_in_place(&mut ctrl_tf_buf, &n_per_row);
+    let controls = read_control_block(reader, chrom_names.len())?;
 
     writeln!(out, "##[control positions]")?;
     writeln!(out, "# chrom\tstart\tend\tindex")?;
-    let mut tf_cursor: usize = 0;
-    for i in 0..n_controls {
-        let chrom = &chrom_names[ctrl_chrom_ids[i] as usize];
-        let start = u32::from_le_bytes([
-            ctrl_starts_buf[i * 4],
-            ctrl_starts_buf[i * 4 + 1],
-            ctrl_starts_buf[i * 4 + 2],
-            ctrl_starts_buf[i * 4 + 3],
-        ]);
-        let n_idx = n_per_row[i];
-
-        // Build comma-separated index list
-        let mut indices = String::new();
-        for j in 0..n_idx {
-            let tf_idx = u16::from_le_bytes([
-                ctrl_tf_buf[(tf_cursor + j) * 2],
-                ctrl_tf_buf[(tf_cursor + j) * 2 + 1],
-            ]);
+    let mut indices = String::new();
+    for (i, (chrom_id, &start)) in run_chroms(&controls.chrom_runs)
+        .zip(&controls.starts)
+        .enumerate()
+    {
+        let row =
+            &controls.features[controls.offsets[i] as usize..controls.offsets[i + 1] as usize];
+        indices.clear();
+        for (j, tf_idx) in row.iter().enumerate() {
             if j > 0 {
                 indices.push(',');
             }
             indices.push_str(&tf_idx.to_string());
         }
-        tf_cursor += n_idx;
-
         writeln!(
             out,
             "{}\t{}\t{}\t{}",
-            chrom,
+            chrom_names[chrom_id as usize],
             start,
             start + window - 1,
             indices
@@ -2474,215 +2880,91 @@ fn parse_binary_index(reader: &mut impl Read) -> io::Result<IndexData> {
             t_phase = Instant::now();
         };
     }
-    // Helper functions
-    fn read_u8(r: &mut impl Read) -> io::Result<u8> {
-        let mut buf = [0u8; 1];
-        r.read_exact(&mut buf)?;
-        Ok(buf[0])
+    // Header. Provenance and matrices do not affect scoring; only the build
+    // date is reported.
+    let h = read_index_header(reader)?;
+    eprintln!("Index genome: {}", h.genome);
+    eprintln!("Index motif set: {}", h.motif_set);
+    if let Some((_, date)) = h.build.iter().find(|(k, _)| k == "build_date") {
+        eprintln!("Index built: {}", date);
     }
-    fn read_u16_le(r: &mut impl Read) -> io::Result<u16> {
-        let mut buf = [0u8; 2];
-        r.read_exact(&mut buf)?;
-        Ok(u16::from_le_bytes(buf))
-    }
-    fn read_u32_le(r: &mut impl Read) -> io::Result<u32> {
-        let mut buf = [0u8; 4];
-        r.read_exact(&mut buf)?;
-        Ok(u32::from_le_bytes(buf))
-    }
-    fn read_string(r: &mut impl Read) -> io::Result<String> {
-        let len = read_u16_le(r)? as usize;
-        let mut buf = vec![0u8; len];
-        r.read_exact(&mut buf)?;
-        String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
-
-    // Version. Only v1 (the released format) is supported; the pre-release
-    // formats never shipped, so there is nothing else to read.
-    let version = read_u8(reader)?;
-    if version != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Unsupported binary index version: {version} (expected 1)"),
-        ));
-    }
-
-    // Header
-    let genome_name = read_string(reader)?;
-    let motif_set = read_string(reader)?;
-    let window = read_u32_le(reader)?;
-    let n_tfs = read_u16_le(reader)? as usize;
-    let n_chroms = read_u8(reader)? as usize;
-
-    eprintln!("Index genome: {}", genome_name);
-    eprintln!("Index motif set: {}", motif_set);
-
-    // TF names
-    let mut tf_list = Vec::with_capacity(n_tfs);
-    for _ in 0..n_tfs {
-        tf_list.push(read_string(reader)?);
-    }
-
-    // Instance counts: site_counts then control_counts
-    let mut n_instances = Vec::with_capacity(n_tfs * 2);
-    for _ in 0..(n_tfs * 2) {
-        n_instances.push(read_u32_le(reader)?);
-    }
-
-    // Chromosome table
+    let window = h.window;
+    let n_chroms = h.chroms.len();
+    let tf_list = h.ids;
+    let tf_names = h.names;
+    let n_instances = h.n_instances;
     let mut chrom_names = Vec::with_capacity(n_chroms);
     let mut chrom_sizes: FxHashMap<String, u32> = FxHashMap::default();
-    for _ in 0..n_chroms {
-        let name = read_string(reader)?;
-        let size = read_u32_le(reader)?;
+    for (name, size) in h.chroms {
         chrom_sizes.insert(name.clone(), size);
         chrom_names.push(name);
     }
     tick!("header");
 
-    // Site positions (columnar)
-    let n_sites = read_u32_le(reader)? as usize;
-    let mut site_chrom_ids = vec![0u8; n_sites];
-    reader.read_exact(&mut site_chrom_ids)?;
-    let mut site_starts_buf = vec![0u8; n_sites * 4];
-    reader.read_exact(&mut site_starts_buf)?;
-    let mut site_tf_buf = vec![0u8; n_sites * 2];
-    reader.read_exact(&mut site_tf_buf)?;
-    // Chromosome IDs index directly into fixed-size per-chromosome vectors
-    // below, so an out-of-range ID in a corrupt file would panic rather than
-    // report an error. Validate against the header's chromosome count first.
-    check_chrom_ids(&site_chrom_ids, chrom_names.len(), "site")?;
-    tick!("read site columnar");
-    cumsum_per_chrom_in_place(&mut site_starts_buf, &site_chrom_ids);
-    tick!("cumsum sites");
-
-    // Accumulate intervals into Vec<Vec<Interval>> indexed by chrom_id (u8).
-    // This avoids per-fragment String::clone + HashMap::entry probes on the
-    // hot loop (~41M+ iterations); we materialise the FxHashMap<String, _>
-    // shape that build_index_result expects in one bulk pass at the end.
-    let n_chroms = chrom_names.len();
+    // Intervals are gathered per chromosome ID, which avoids per-row
+    // String::clone + HashMap::entry probes on the hot loop (~41M+
+    // iterations); the FxHashMap<String, _> shape that build_index_result
+    // expects is materialised in one bulk pass at the end. Each chromosome's
+    // Vec is reserved from the run lengths before each block's pushes.
     let mut chromosome_intervals: Vec<Vec<Interval<u32, u32>>> =
         (0..n_chroms).map(|_| Vec::new()).collect();
-    // Pre-count per-chrom site occurrences so each per-chrom Vec is sized
-    // once instead of doubling repeatedly during the push loop below.
-    let mut per_chrom_site_counts = vec![0usize; n_chroms];
-    for &cid in &site_chrom_ids {
-        per_chrom_site_counts[cid as usize] += 1;
-    }
-    for (cid, &cnt) in per_chrom_site_counts.iter().enumerate() {
-        chromosome_intervals[cid].reserve(cnt);
+    fn push_intervals(
+        intervals: &mut [Vec<Interval<u32, u32>>],
+        runs: &[(u32, usize)],
+        starts: &[u32],
+        window: u32,
+        first_val: u32,
+    ) -> io::Result<()> {
+        for &(cid, k) in runs {
+            intervals[cid as usize].reserve(k);
+        }
+        let mut row = 0usize;
+        for &(cid, k) in runs {
+            let ivs = &mut intervals[cid as usize];
+            for (i, &start) in starts.iter().enumerate().skip(row).take(k) {
+                let start0 = one_based_start_to_zero_based(start)?;
+                ivs.push(Interval {
+                    start: start0,
+                    stop: start0 + window,
+                    val: first_val + i as u32,
+                });
+            }
+            row += k;
+        }
+        Ok(())
     }
 
-    let mut site_indices: Vec<u32> = Vec::with_capacity(n_sites);
-    for i in 0..n_sites {
-        let chrom_id = site_chrom_ids[i] as usize;
-        let start = u32::from_le_bytes([
-            site_starts_buf[i * 4],
-            site_starts_buf[i * 4 + 1],
-            site_starts_buf[i * 4 + 2],
-            site_starts_buf[i * 4 + 3],
-        ]);
-        let start0 = one_based_start_to_zero_based(start)?;
-        let tf_idx = u16::from_le_bytes([site_tf_buf[i * 2], site_tf_buf[i * 2 + 1]]) as u32;
-
-        chromosome_intervals[chrom_id].push(Interval {
-            start: start0,
-            stop: start0 + window,
-            val: i as u32,
-        });
-        site_indices.push(tf_idx);
-    }
+    // Site positions (columnar)
+    let sites = read_site_block(reader, n_chroms)?;
+    tick!("read site columns");
+    let n_sites = sites.starts.len();
+    push_intervals(
+        &mut chromosome_intervals,
+        &sites.chrom_runs,
+        &sites.starts,
+        window,
+        0,
+    )?;
+    let site_indices = sites.features;
     let num_site_intervals = n_sites;
     tick!("build site intervals");
 
-    // Control positions (columnar)
-    let n_controls = read_u32_le(reader)? as usize;
-    let mut ctrl_chrom_ids = vec![0u8; n_controls];
-    reader.read_exact(&mut ctrl_chrom_ids)?;
-    let mut ctrl_starts_buf = vec![0u8; n_controls * 4];
-    reader.read_exact(&mut ctrl_starts_buf)?;
-    check_chrom_ids(&ctrl_chrom_ids, chrom_names.len(), "control")?;
-    tick!("read ctrl chrom+starts");
-    cumsum_per_chrom_in_place(&mut ctrl_starts_buf, &ctrl_chrom_ids);
-    tick!("cumsum ctrl starts");
-    let n_per_row: Vec<usize> = {
-        let mut buf = vec![0u8; n_controls * 2];
-        reader.read_exact(&mut buf)?;
-        (0..n_controls)
-            .map(|i| u16::from_le_bytes([buf[i * 2], buf[i * 2 + 1]]) as usize)
-            .collect()
-    };
-    tick!("read n_per_row");
-    let total_ctrl_indices = read_u32_le(reader)? as usize;
-    // `n_per_row` and `total_indices` are independent fields in the file, and
-    // the within-row cumsum below walks `n_per_row` across `ctrl_tf_buf`. If
-    // they disagree the walk runs off the end of the buffer and panics, so
-    // reconcile them before touching it.
-    let n_per_row_total: usize = n_per_row.iter().sum();
-    if n_per_row_total != total_ctrl_indices {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "Malformed index: control rows declare {n_per_row_total} feature index/indices \
-                 in total but the index states {total_ctrl_indices}"
-            ),
-        ));
-    }
-    let mut ctrl_tf_buf = vec![0u8; total_ctrl_indices * 2];
-    reader.read_exact(&mut ctrl_tf_buf)?;
-    tick!("read ctrl tf buf");
-    cumsum_within_row_u16_in_place(&mut ctrl_tf_buf, &n_per_row);
-    tick!("cumsum within row");
-
-    // Pre-size each chrom's vec for the additional control intervals it
-    // will receive. Combined with the earlier site reservation this means
-    // the chromosome_intervals push loop should hit zero reallocations.
-    let mut per_chrom_ctrl_counts = vec![0usize; n_chroms];
-    for &cid in &ctrl_chrom_ids {
-        per_chrom_ctrl_counts[cid as usize] += 1;
-    }
-    for (cid, &cnt) in per_chrom_ctrl_counts.iter().enumerate() {
-        chromosome_intervals[cid].reserve(cnt);
-    }
-
-    // control_data is just the cumsum-corrected ctrl_tf_buf widened to u32.
-    // Computing it in one tight loop is much cheaper than the previous
-    // nested-per-row push.
-    let mut control_data: Vec<u32> = Vec::with_capacity(total_ctrl_indices);
-    for i in 0..total_ctrl_indices {
-        let v = u16::from_le_bytes([ctrl_tf_buf[i * 2], ctrl_tf_buf[i * 2 + 1]]) as u32;
-        control_data.push(v);
-    }
-    // control_offsets is the prefix sum of n_per_row.
-    let mut control_offsets: Vec<u32> = Vec::with_capacity(n_controls + 1);
-    control_offsets.push(0);
-    let mut acc: u32 = 0;
-    for &n in &n_per_row {
-        acc += n as u32;
-        control_offsets.push(acc);
-    }
-
-    tick!("convert ctrl_data u16->u32");
-
-    let site_intervals_offset = n_sites as u32;
-    for i in 0..n_controls {
-        let chrom_id = ctrl_chrom_ids[i] as usize;
-        let start = u32::from_le_bytes([
-            ctrl_starts_buf[i * 4],
-            ctrl_starts_buf[i * 4 + 1],
-            ctrl_starts_buf[i * 4 + 2],
-            ctrl_starts_buf[i * 4 + 3],
-        ]);
-        let start0 = one_based_start_to_zero_based(start)?;
-
-        chromosome_intervals[chrom_id].push(Interval {
-            start: start0,
-            stop: start0 + window,
-            val: site_intervals_offset + i as u32,
-        });
-    }
-
-    tick!("build ctrl data+ivs");
+    // Control positions (columnar). Interval values continue after the sites.
+    // Reading stops after this block: anything that follows is an optional
+    // section from a newer writer, which this reader skips (see the format
+    // docs on `BachaIndex`).
+    let controls = read_control_block(reader, n_chroms)?;
+    tick!("read ctrl columns");
+    push_intervals(
+        &mut chromosome_intervals,
+        &controls.chrom_runs,
+        &controls.starts,
+        window,
+        n_sites as u32,
+    )?;
+    let control_data = controls.features;
+    let control_offsets = controls.offsets;
+    tick!("build ctrl intervals");
 
     // Materialise the FxHashMap<String, Vec<Interval>> shape that
     // build_index_result expects. Empty chroms are dropped.
@@ -2702,6 +2984,7 @@ fn parse_binary_index(reader: &mut impl Read) -> io::Result<IndexData> {
         control_offsets,
         num_site_intervals,
         tf_list,
+        tf_names,
         n_instances,
         chrom_sizes,
     );
@@ -2723,6 +3006,7 @@ fn build_index_result(
     control_offsets: Vec<u32>,
     num_site_intervals: usize,
     tf_order: Vec<String>,
+    tf_names: Vec<String>,
     n_instances: Vec<u32>,
     chrom_sizes: FxHashMap<String, u32>,
 ) -> io::Result<IndexData> {
@@ -2738,6 +3022,17 @@ fn build_index_result(
             io::ErrorKind::InvalidData,
             "Malformed index: no features defined",
         ));
+    }
+    // Feature IDs name the output rows (`--feature-names id`) and qualify
+    // repeated display names, so they must be unique.
+    {
+        let mut seen: HashSet<&str> = HashSet::with_capacity(n_tfs);
+        if let Some(dup) = tf_order.iter().find(|id| !seen.insert(id.as_str())) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Malformed index: feature ID {dup} appears more than once"),
+            ));
+        }
     }
     // Sites carry a 1-based feature index; controls carry the same index
     // offset by n_tfs so both share one ID space (see the index format docs).
@@ -2796,6 +3091,7 @@ fn build_index_result(
         control_indices,
         num_site_intervals,
         tf_order,
+        tf_names,
         n_instances,
         chrom_sizes,
     ))
@@ -2842,11 +3138,23 @@ struct TestIndex {
     window: u32,
     tf_names: Vec<String>,
     chroms: Vec<(String, u32)>,
-    sites: Vec<(u8, u32, u16)>,
-    controls: Vec<(u8, u32, Vec<u16>)>,
+    sites: Vec<(u32, u32, u32)>,
+    controls: Vec<(u32, u32, Vec<u32>)>,
     // Overrides the `total_indices` header field, to test a file whose
     // per-row counts and total disagree.
     total_indices_override: Option<u32>,
+    // Build provenance key/value pairs; may be empty.
+    build: Vec<(String, String)>,
+    // Display names, one per entry of `tf_names` (which are written as the
+    // feature IDs); empty means each name equals its ID.
+    names: Vec<String>,
+    // Matrix section: `None` writes the absent flag; otherwise one entry per
+    // feature of (value type, position-major A/C/G/T values), or `None` for a
+    // feature without a matrix.
+    matrices: Option<Vec<Option<(u8, Vec<f32>)>>>,
+    // Bytes appended after the control block, as a newer writer's optional
+    // section would be.
+    trailing: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -2854,7 +3162,7 @@ impl TestIndex {
     // One TF on `n_chroms` chromosomes of `chrom_len` bp, each carrying a
     // single 1 bp site and a single 1 bp control at the given 1-based
     // positions. Chromosomes are named chr1..chrN.
-    fn simple(n_chroms: u8, chrom_len: u32, site_at: u32, control_at: u32) -> Self {
+    fn simple(n_chroms: u32, chrom_len: u32, site_at: u32, control_at: u32) -> Self {
         TestIndex {
             window: 1,
             tf_names: vec!["TF1".to_string()],
@@ -2864,6 +3172,10 @@ impl TestIndex {
             sites: (0..n_chroms).map(|c| (c, site_at, 1)).collect(),
             controls: (0..n_chroms).map(|c| (c, control_at, vec![2])).collect(),
             total_indices_override: None,
+            build: Vec::new(),
+            names: Vec::new(),
+            matrices: None,
+            trailing: Vec::new(),
         }
     }
 
@@ -2881,16 +3193,22 @@ impl TestIndex {
         put_str(&mut b, "TestGenome");
         put_str(&mut b, "TestMotifs");
         b.extend_from_slice(&self.window.to_le_bytes());
-        b.extend_from_slice(&(n_tfs as u16).to_le_bytes());
-        b.push(self.chroms.len() as u8);
-        for name in &self.tf_names {
-            put_str(&mut b, name);
+        b.extend_from_slice(&(n_tfs as u32).to_le_bytes());
+        b.extend_from_slice(&(self.chroms.len() as u32).to_le_bytes());
+        b.extend_from_slice(&(self.build.len() as u16).to_le_bytes());
+        for (key, value) in &self.build {
+            put_str(&mut b, key);
+            put_str(&mut b, value);
+        }
+        for (i, id) in self.tf_names.iter().enumerate() {
+            put_str(&mut b, id);
+            put_str(&mut b, self.names.get(i).unwrap_or(id));
         }
 
         // Instance counts: per-TF site totals, then per-TF control totals.
         let mut site_counts = vec![0u32; n_tfs];
         for &(_, _, tf) in &self.sites {
-            if (1..=n_tfs as u16).contains(&tf) {
+            if (1..=n_tfs as u32).contains(&tf) {
                 site_counts[tf as usize - 1] += 1;
             }
         }
@@ -2910,15 +3228,51 @@ impl TestIndex {
             put_str(&mut b, name);
             b.extend_from_slice(&len.to_le_bytes());
         }
+        match &self.matrices {
+            None => b.push(0),
+            Some(ms) => {
+                b.push(1);
+                for m in ms {
+                    match m {
+                        None => {
+                            b.push(MATRIX_NONE);
+                            b.extend_from_slice(&0u16.to_le_bytes());
+                        }
+                        Some((kind, values)) => {
+                            b.push(*kind);
+                            b.extend_from_slice(&((values.len() / 4) as u16).to_le_bytes());
+                            for v in values {
+                                b.extend_from_slice(&v.to_le_bytes());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Varint column: u64 LE byte length, then unsigned LEB128 values.
+        let put_varints = |b: &mut Vec<u8>, values: &[u32]| {
+            let mut col = Vec::new();
+            for &v in values {
+                let mut v = v;
+                while v >= 0x80 {
+                    col.push((v as u8 & 0x7f) | 0x80);
+                    v >>= 7;
+                }
+                col.push(v as u8);
+            }
+            b.extend_from_slice(&(col.len() as u64).to_le_bytes());
+            b.extend_from_slice(&col);
+        };
 
         // Starts are delta-encoded within each chromosome run, so entries must
         // be grouped by chromosome; sort to guarantee that.
-        let delta_per_chrom = |entries: &[(u8, u32)]| -> Vec<u32> {
+        let delta_per_chrom = |entries: &[(u32, u32)]| -> Vec<u32> {
             let mut out = Vec::with_capacity(entries.len());
-            let mut prev: Option<(u8, u32)> = None;
+            let mut prev: Option<(u32, u32)> = None;
             for &(c, s) in entries {
                 out.push(match prev {
-                    Some((pc, ps)) if pc == c => s.wrapping_sub(ps),
+                    Some((pc, ps)) if pc == c => s - ps,
                     _ => s,
                 });
                 prev = Some((c, s));
@@ -2929,42 +3283,39 @@ impl TestIndex {
         let mut sites = self.sites.clone();
         sites.sort_by_key(|&(c, s, _)| (c, s));
         b.extend_from_slice(&(sites.len() as u32).to_le_bytes());
-        for &(c, _, _) in &sites {
-            b.push(c);
-        }
-        let site_keys: Vec<(u8, u32)> = sites.iter().map(|&(c, s, _)| (c, s)).collect();
-        for d in delta_per_chrom(&site_keys) {
-            b.extend_from_slice(&d.to_le_bytes());
-        }
-        for &(_, _, tf) in &sites {
-            b.extend_from_slice(&tf.to_le_bytes());
-        }
+        let site_chroms: Vec<u32> = sites.iter().map(|&(c, _, _)| c).collect();
+        put_varints(&mut b, &site_chroms);
+        let site_keys: Vec<(u32, u32)> = sites.iter().map(|&(c, s, _)| (c, s)).collect();
+        put_varints(&mut b, &delta_per_chrom(&site_keys));
+        let site_tfs: Vec<u32> = sites.iter().map(|&(_, _, tf)| tf).collect();
+        put_varints(&mut b, &site_tfs);
 
         let mut controls = self.controls.clone();
         controls.sort_by_key(|(c, s, _)| (*c, *s));
         b.extend_from_slice(&(controls.len() as u32).to_le_bytes());
-        for (c, _, _) in &controls {
-            b.push(*c);
-        }
-        let ctrl_keys: Vec<(u8, u32)> = controls.iter().map(|(c, s, _)| (*c, *s)).collect();
-        for d in delta_per_chrom(&ctrl_keys) {
-            b.extend_from_slice(&d.to_le_bytes());
-        }
-        for (_, _, idx) in &controls {
-            b.extend_from_slice(&(idx.len() as u16).to_le_bytes());
-        }
-        let total: u32 = controls.iter().map(|(_, _, i)| i.len() as u32).sum();
+        let ctrl_chroms: Vec<u32> = controls.iter().map(|(c, _, _)| *c).collect();
+        put_varints(&mut b, &ctrl_chroms);
+        let ctrl_keys: Vec<(u32, u32)> = controls.iter().map(|(c, s, _)| (*c, *s)).collect();
+        put_varints(&mut b, &delta_per_chrom(&ctrl_keys));
+        let n_per_row: Vec<u32> = controls.iter().map(|(_, _, i)| i.len() as u32).collect();
+        put_varints(&mut b, &n_per_row);
+        let total: u32 = n_per_row.iter().sum();
         b.extend_from_slice(&self.total_indices_override.unwrap_or(total).to_le_bytes());
-        // Feature indices are delta-encoded within each control row.
+        // Feature indices are delta-encoded within each control row; the
+        // column holds as many values as the stated total.
+        let mut deltas: Vec<u32> = Vec::new();
         for (_, _, idx) in &controls {
-            let mut prev = 0u16;
-            for (j, &tf) in idx.iter().enumerate() {
-                b.extend_from_slice(
-                    &(if j == 0 { tf } else { tf.wrapping_sub(prev) }).to_le_bytes(),
-                );
+            let mut sorted = idx.clone();
+            sorted.sort_unstable();
+            let mut prev = 0u32;
+            for (j, &tf) in sorted.iter().enumerate() {
+                deltas.push(if j == 0 { tf } else { tf - prev });
                 prev = tf;
             }
         }
+        deltas.resize(self.total_indices_override.unwrap_or(total) as usize, 0);
+        put_varints(&mut b, &deltas);
+        b.extend_from_slice(&self.trailing);
 
         let file = File::create(path)?;
         let mut encoder = flate2::write::GzEncoder::new(file, Compression::default());
@@ -3522,6 +3873,10 @@ fn test_interval_free_chromosome_in_table_is_not_a_mismatch() -> io::Result<()> 
         sites: vec![(0, 100, 1)],
         controls: vec![(0, 200, vec![2])],
         total_indices_override: None,
+        build: Vec::new(),
+        names: Vec::new(),
+        matrices: None,
+        trailing: Vec::new(),
     };
 
     // Every fragment on the interval-free chromosome: previously indistinguishable
@@ -3575,8 +3930,19 @@ fn test_zero_threads_is_rejected_before_counting() -> io::Result<()> {
         fixture("zero_threads", &idx, "chr1\t99\t200\tcell1\n", "cell1\n")?;
     let out = index.parent().unwrap().join("scores.csv.gz");
 
-    let err = bacha(&fragments, &index, &cells, &out, 0, 10.0, 1.0, true)
-        .expect_err("-t 0 must be rejected");
+    let err = bacha(
+        &fragments,
+        &index,
+        &cells,
+        &out,
+        0,
+        10.0,
+        1.0,
+        ShrinkTarget::Zero,
+        FeatureNames::Name,
+        true,
+    )
+    .expect_err("-t 0 must be rejected");
     assert!(
         err.to_string().contains("threads must be >= 1"),
         "unexpected error: {err}"
@@ -3665,6 +4031,10 @@ fn test_fragment_counted_once_per_interval() -> io::Result<()> {
         sites: vec![(0, 1001, 1)],
         controls: vec![(0, 2001, vec![2])],
         total_indices_override: None,
+        build: Vec::new(),
+        names: Vec::new(),
+        matrices: None,
+        trailing: Vec::new(),
     };
 
     // (label, fragment, expected site count, expected control count).
@@ -3717,6 +4087,10 @@ fn test_shared_control_counted_once_per_feature_per_fragment() -> io::Result<()>
         // n_tfs + 1 and n_tfs + 2).
         controls: vec![(0, 2001, vec![3, 4])],
         total_indices_override: None,
+        build: Vec::new(),
+        names: Vec::new(),
+        matrices: None,
+        trailing: Vec::new(),
     };
     // Both insertions inside the shared control window.
     let (index, fragments, cells) = fixture(
@@ -3751,6 +4125,10 @@ fn test_second_insertion_is_at_end_minus_one() -> io::Result<()> {
         sites: vec![(0, 1001, 1)],
         controls: vec![(0, 5001, vec![2])],
         total_indices_override: None,
+        build: Vec::new(),
+        names: Vec::new(),
+        matrices: None,
+        trailing: Vec::new(),
     };
 
     // Each fragment starts far from the site, so only its second insertion can
@@ -3954,6 +4332,214 @@ fn test_errors_when_no_fragment_matches_a_cell_barcode() -> io::Result<()> {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn test_index_build_block_is_read_and_skipped_for_counting() -> io::Result<()> {
+    // Same layout as the one-based counting test, but with a populated
+    // provenance block: counts must be unaffected by the extra header bytes.
+    let mut idx = TestIndex::simple(1, 100, 10, 20);
+    idx.build = vec![
+        ("build_date".to_string(), "2026-11-13T00:00:00Z".to_string()),
+        ("match_features".to_string(), "GC,entropy".to_string()),
+        ("empty_value".to_string(), String::new()),
+    ];
+    let (index, fragments, cells) =
+        fixture("build_block", &idx, "chr1\t9\t20\tcell1\n", "cell1\n")?;
+
+    let (count_matrix, _, tf_list, n_instances) = fcount_core(&fragments, &index, &cells, 1, true)?;
+    assert_eq!(tf_list, vec!["TF1"]);
+    assert_eq!(n_instances, vec![1, 1]);
+    assert_eq!(count_matrix[[0, 0]], 1, "site feature");
+    assert_eq!(count_matrix[[0, 1]], 1, "control feature");
+
+    // `view` prints the block as its own section ahead of the chromosome
+    // table, one tab-separated key/value pair per line, in file order.
+    let mut reader = BufReader::new(open_index_decompressed(
+        &index,
+        bgzf_worker_count(DEFAULT_BGZF_WORKERS),
+    )?);
+    read_magic(&mut reader)?;
+    let mut out: Vec<u8> = Vec::new();
+    view_binary_index(&mut reader, true, &mut out)?;
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.starts_with("## format: binary v1\n"), "got:\n{text}");
+    assert!(
+        text.contains(
+            "##[build]\nbuild_date\t2026-11-13T00:00:00Z\n\
+             match_features\tGC,entropy\nempty_value\t\n\
+             ##[features]\n# id\tname\nTF1\tTF1\n##[chromosome sizes]\n"
+        ),
+        "got:\n{text}"
+    );
+
+    std::fs::remove_dir_all(index.parent().unwrap())?;
+    Ok(())
+}
+
+#[test]
+fn test_empty_build_block_prints_no_build_section() -> io::Result<()> {
+    let idx = TestIndex::simple(1, 100, 10, 20);
+    let (index, _, _) = fixture("empty_build", &idx, "chr1\t9\t20\tcell1\n", "cell1\n")?;
+    let mut reader = BufReader::new(open_index_decompressed(
+        &index,
+        bgzf_worker_count(DEFAULT_BGZF_WORKERS),
+    )?);
+    read_magic(&mut reader)?;
+    let mut out: Vec<u8> = Vec::new();
+    view_binary_index(&mut reader, true, &mut out)?;
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.starts_with("## format: binary v1\n"), "got:\n{text}");
+    assert!(!text.contains("##[build]"), "got:\n{text}");
+
+    std::fs::remove_dir_all(index.parent().unwrap())?;
+    Ok(())
+}
+
+#[test]
+fn test_newer_index_version_is_rejected() -> io::Result<()> {
+    let dir = temp_dir("newer_index_version")?;
+    let index = dir.join("future.bi");
+    let fragments = dir.join("fragments.tsv.gz");
+    let cells = dir.join("cells.txt");
+    write_gzip_text(&index, "BACH\u{2}")?;
+    write_gzip_text(&fragments, "chr1\t99\t199\tcell1\n")?;
+    std::fs::write(&cells, "cell1\n")?;
+
+    let err = fcount_core(&fragments, &index, &cells, 1, true)
+        .expect_err("an index newer than the reader must be rejected");
+    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string()
+            .contains("Unsupported binary index version: 2"),
+        "got: {err}"
+    );
+
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+#[test]
+fn test_feature_labels_qualify_repeated_names() {
+    let ids: Vec<String> = ["MA1", "MA2", "MA3", "MA4"].map(String::from).to_vec();
+    let names: Vec<String> = ["RORA", "RORA", "PAX6", ""].map(String::from).to_vec();
+    assert_eq!(
+        feature_labels(&ids, &names, FeatureNames::Name),
+        vec!["RORA (MA1)", "RORA (MA2)", "PAX6", "MA4"]
+    );
+    assert_eq!(feature_labels(&ids, &names, FeatureNames::Id), ids);
+}
+
+#[test]
+fn test_feature_names_option_labels_output_rows() -> io::Result<()> {
+    let mut idx = TestIndex::simple(1, 100, 10, 20);
+    idx.tf_names = vec!["MA0001.1".to_string(), "MA0002.1".to_string()];
+    idx.names = vec!["RORA".to_string(), "PAX6".to_string()];
+    idx.sites.push((0, 30, 2));
+    idx.controls[0].2 = vec![3, 4];
+    let (index, fragments, cells) =
+        fixture("feature_names", &idx, "chr1\t9\t20\tcell1\n", "cell1\n")?;
+    let dir = index.parent().unwrap().to_path_buf();
+
+    let rows = |mode: FeatureNames, file: &str| -> io::Result<Vec<String>> {
+        let out = dir.join(file);
+        bacha(
+            &fragments,
+            &index,
+            &cells,
+            &out,
+            1,
+            10.0,
+            1.0,
+            ShrinkTarget::Zero,
+            mode,
+            true,
+        )
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        Ok(std::fs::read_to_string(&out)?
+            .lines()
+            .skip(1)
+            .map(|l| l.split(',').next().unwrap().to_string())
+            .collect())
+    };
+    assert_eq!(
+        rows(FeatureNames::Name, "by_name.csv")?,
+        vec!["RORA", "PAX6"]
+    );
+    assert_eq!(
+        rows(FeatureNames::Id, "by_id.csv")?,
+        vec!["MA0001.1", "MA0002.1"]
+    );
+
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+#[test]
+fn test_duplicate_feature_ids_are_rejected() -> io::Result<()> {
+    let mut idx = TestIndex::simple(1, 100, 10, 20);
+    idx.tf_names = vec!["MA1".to_string(), "MA1".to_string()];
+    idx.controls[0].2 = vec![3];
+    let (index, fragments, cells) =
+        fixture("duplicate_ids", &idx, "chr1\t9\t20\tcell1\n", "cell1\n")?;
+    let err = fcount_core(&fragments, &index, &cells, 1, true)
+        .expect_err("duplicate feature IDs must be rejected");
+    assert!(
+        err.to_string()
+            .contains("feature ID MA1 appears more than once"),
+        "got: {err}"
+    );
+    std::fs::remove_dir_all(index.parent().unwrap())?;
+    Ok(())
+}
+
+#[test]
+fn test_index_motifs_round_trip() -> io::Result<()> {
+    let mut idx = TestIndex::simple(1, 100, 10, 20);
+    idx.tf_names = vec!["MA1".to_string(), "MA2".to_string()];
+    idx.names = vec!["RORA".to_string(), "PAX6".to_string()];
+    idx.controls[0].2 = vec![3];
+    // two positions, position-major A/C/G/T; the second feature has none
+    idx.matrices = Some(vec![
+        Some((1, vec![4.0, 0.0, 1.0, 5.0, 0.5, 9.0, 0.0, 0.5])),
+        None,
+    ]);
+    let (index, fragments, cells) = fixture("motifs", &idx, "chr1\t9\t20\tcell1\n", "cell1\n")?;
+
+    let mut out: Vec<u8> = Vec::new();
+    write_index_motifs(&index, &mut out)?;
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        ">MA1\tRORA\tcounts\nA  [ 4 0.5 ]\nC  [ 0 9 ]\nG  [ 1 0 ]\nT  [ 5 0.5 ]\n"
+    );
+
+    // Matrices are skipped when counting, and `view` reports how many exist.
+    let (m, _, tf_list, _) = fcount_core(&fragments, &index, &cells, 1, true)?;
+    assert_eq!(tf_list, vec!["MA1", "MA2"]);
+    assert_eq!(m[[0, 0]], 1);
+    let mut reader = BufReader::new(open_index_decompressed(
+        &index,
+        bgzf_worker_count(DEFAULT_BGZF_WORKERS),
+    )?);
+    read_magic(&mut reader)?;
+    let mut view: Vec<u8> = Vec::new();
+    view_binary_index(&mut reader, true, &mut view)?;
+    let text = String::from_utf8(view).unwrap();
+    assert!(text.contains("## matrices: 1\n"), "got:\n{text}");
+    assert!(
+        text.contains("##[features]\n# id\tname\nMA1\tRORA\nMA2\tPAX6\n"),
+        "got:\n{text}"
+    );
+
+    // An index without matrices has nothing to export.
+    let plain = TestIndex::simple(1, 100, 10, 20);
+    let plain_path = index.with_file_name("plain.bi");
+    plain.write(&plain_path)?;
+    let err = write_index_motifs(&plain_path, &mut Vec::new()).expect_err("no matrices");
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+    std::fs::remove_dir_all(index.parent().unwrap())?;
+    Ok(())
+}
+
+#[test]
 fn test_text_index_is_rejected() -> io::Result<()> {
     let dir = temp_dir("text_index_rejected")?;
     let index = dir.join("legacy.bacha.gz");
@@ -4058,6 +4644,165 @@ fn test_malformed_index_is_rejected_at_load() -> io::Result<()> {
     Ok(())
 }
 
+// Encode a varint column the way the index writers do, for decoder tests.
+#[cfg(test)]
+fn varint_column_bytes(values: &[u32]) -> Vec<u8> {
+    let mut col = Vec::new();
+    for &v in values {
+        let mut v = v;
+        while v >= 0x80 {
+            col.push((v as u8 & 0x7f) | 0x80);
+            v >>= 7;
+        }
+        col.push(v as u8);
+    }
+    let mut out = (col.len() as u64).to_le_bytes().to_vec();
+    out.extend_from_slice(&col);
+    out
+}
+
+#[cfg(test)]
+fn decode_varint_column(bytes: &[u8], n: usize) -> io::Result<Vec<u32>> {
+    let mut values = Vec::new();
+    let mut r = bytes;
+    read_varint_column(&mut r, n, "test", |v| {
+        values.push(v);
+        Ok(())
+    })?;
+    Ok(values)
+}
+
+#[test]
+fn test_varint_column_round_trip() -> io::Result<()> {
+    // Every byte-width boundary, up to the full u32 range.
+    let values = [
+        0,
+        1,
+        127,
+        128,
+        300,
+        16_383,
+        16_384,
+        2_097_151,
+        2_097_152,
+        268_435_455,
+        268_435_456,
+        u32::MAX,
+    ];
+    let bytes = varint_column_bytes(&values);
+    assert_eq!(&bytes[8..13], &[0x00, 0x01, 0x7f, 0x80, 0x01]);
+    assert_eq!(decode_varint_column(&bytes, values.len())?, values);
+    // Longer than the decoder's internal buffer, so refills are exercised.
+    let long: Vec<u32> = (0..200_000u32)
+        .map(|i| i.wrapping_mul(2_654_435_761))
+        .collect();
+    assert_eq!(
+        decode_varint_column(&varint_column_bytes(&long), long.len())?,
+        long
+    );
+    assert!(decode_varint_column(&varint_column_bytes(&[]), 0)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_malformed_varint_column_is_rejected() {
+    let with_len = |len: u64, body: &[u8]| {
+        let mut b = len.to_le_bytes().to_vec();
+        b.extend_from_slice(body);
+        b
+    };
+    let cases: [(&str, Vec<u8>, usize, &str); 4] = [
+        // Two bytes cannot hold three values.
+        ("too_short", with_len(2, &[1, 2]), 3, "cannot hold 3 values"),
+        // The last value's continuation bit runs past the column's end.
+        (
+            "truncated_value",
+            with_len(2, &[1, 0x80]),
+            2,
+            "ends after 1 of 2",
+        ),
+        (
+            "trailing_bytes",
+            with_len(3, &[1, 2, 3]),
+            2,
+            "1 byte(s) left",
+        ),
+        (
+            "wider_than_u32",
+            with_len(5, &[0xff, 0xff, 0xff, 0xff, 0x1f]),
+            1,
+            "wider than 32 bits",
+        ),
+    ];
+    for (name, bytes, n, expected) in cases {
+        let err = decode_varint_column(&bytes, n).expect_err(name);
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{name}: {err}");
+        assert!(
+            err.to_string().contains(expected),
+            "{name}: message {:?} does not mention {expected:?}",
+            err.to_string()
+        );
+    }
+}
+
+// Chromosome IDs are varints, so the chromosome table is not limited to 255
+// entries; a fragment on the 300th chromosome is counted.
+#[test]
+fn test_index_with_more_than_255_chromosomes() -> io::Result<()> {
+    let idx = TestIndex::simple(300, 1000, 100, 200);
+    let (index, fragments, cells) =
+        fixture("many_chroms", &idx, "chr300\t99\t200\tcell1\n", "cell1\n")?;
+    let (count_matrix, _, _, n_instances) = fcount_core(&fragments, &index, &cells, 1, true)?;
+    assert_eq!(n_instances, vec![300, 300]);
+    assert_eq!(count_matrix[[0, 0]], 1, "site feature");
+    assert_eq!(count_matrix[[0, 1]], 1, "control feature");
+    std::fs::remove_dir_all(index.parent().unwrap())?;
+    Ok(())
+}
+
+// Readers stop after the control block, so a section appended by a newer
+// writer leaves the index loadable and the counts unchanged.
+#[test]
+fn test_data_after_control_block_is_ignored() -> io::Result<()> {
+    let mut idx = TestIndex::simple(1, 100, 10, 20);
+    idx.trailing = b"FUTURE-SECTION\x00\x01\x02".to_vec();
+    let (index, fragments, cells) =
+        fixture("trailing_data", &idx, "chr1\t9\t20\tcell1\n", "cell1\n")?;
+    let (count_matrix, _, _, _) = fcount_core(&fragments, &index, &cells, 1, true)?;
+    assert_eq!(count_matrix[[0, 0]], 1, "site feature");
+    assert_eq!(count_matrix[[0, 1]], 1, "control feature");
+    let mut out = Vec::new();
+    let mut reader = BufReader::new(open_index_decompressed(&index, 1)?);
+    read_magic(&mut reader)?;
+    view_binary_index(&mut reader, false, &mut out)?;
+    assert!(String::from_utf8_lossy(&out).contains("##[control positions]"));
+    std::fs::remove_dir_all(index.parent().unwrap())?;
+    Ok(())
+}
+
+// Feature indices are varints and the feature count is a u32, so an index is
+// not limited to the 32,767 features a u16 column allowed. Controls carry
+// `tf_index + n_tfs`, which here exceeds u16 as well.
+#[test]
+fn test_index_with_more_than_32767_features() -> io::Result<()> {
+    let n_tfs: u32 = 40_000;
+    let mut idx = TestIndex::simple(1, 100, 10, 20);
+    idx.tf_names = (1..=n_tfs).map(|i| format!("TF{i}")).collect();
+    idx.sites = vec![(0, 10, n_tfs)];
+    idx.controls = vec![(0, 20, vec![1 + n_tfs, 2 * n_tfs])];
+    let (index, fragments, cells) =
+        fixture("many_features", &idx, "chr1\t9\t20\tcell1\n", "cell1\n")?;
+    let (count_matrix, _, tf_list, _) = fcount_core(&fragments, &index, &cells, 1, true)?;
+    let n = n_tfs as usize;
+    assert_eq!(tf_list.len(), n);
+    assert_eq!(count_matrix.shape(), &[1, 2 * n]);
+    assert_eq!(count_matrix[[0, n - 1]], 1, "last site feature");
+    assert_eq!(count_matrix[[0, n]], 1, "first control feature");
+    assert_eq!(count_matrix[[0, 2 * n - 1]], 1, "last control feature");
+    std::fs::remove_dir_all(index.parent().unwrap())?;
+    Ok(())
+}
+
 // An existing output path must be reported as an error the caller can handle,
 // not terminate the process from inside the library. It must also leave the
 // existing file untouched.
@@ -4069,8 +4814,19 @@ fn test_existing_output_file_is_an_error() -> io::Result<()> {
     let output = index.parent().unwrap().join("scores.csv");
     std::fs::write(&output, "pre-existing contents\n")?;
 
-    let err = bacha(&fragments, &index, &cells, &output, 1, 10.0, 1.0, true)
-        .expect_err("an existing output file must be rejected");
+    let err = bacha(
+        &fragments,
+        &index,
+        &cells,
+        &output,
+        1,
+        10.0,
+        1.0,
+        ShrinkTarget::Zero,
+        FeatureNames::Name,
+        true,
+    )
+    .expect_err("an existing output file must be rejected");
     let msg = err.to_string();
     assert!(msg.contains("already exists"), "{msg}");
     assert_eq!(
@@ -4086,10 +4842,111 @@ fn test_existing_output_file_is_an_error() -> io::Result<()> {
 
     // The same run succeeds once the path is free.
     std::fs::remove_file(&output)?;
-    bacha(&fragments, &index, &cells, &output, 1, 10.0, 1.0, true)
-        .unwrap_or_else(|e| panic!("scoring should succeed with a free output path: {e}"));
+    bacha(
+        &fragments,
+        &index,
+        &cells,
+        &output,
+        1,
+        10.0,
+        1.0,
+        ShrinkTarget::Zero,
+        FeatureNames::Name,
+        true,
+    )
+    .unwrap_or_else(|e| panic!("scoring should succeed with a free output path: {e}"));
     assert!(std::fs::read_to_string(&output)?.starts_with(",cell1"));
 
     std::fs::remove_dir_all(index.parent().unwrap())?;
+    Ok(())
+}
+
+// `--shrink-to mean` centres the prior on the feature's pseudobulk LFC: the
+// score must equal w * LFC + (1 - w) * mu, with mu the LFC of the summed
+// counts, and `zero` must stay exactly w * LFC.
+#[test]
+fn test_shrink_to_mean_centres_on_pseudobulk_lfc() -> io::Result<()> {
+    // One TF, a 1 bp site at 1-based 100 and a 1 bp control at 200, so
+    // site_ratio r = 1. cell1: 3 site, 1 control. cell2: 1 site, 2 control.
+    let idx = TestIndex::simple(1, 1000, 100, 200);
+    let frags = "chr1\t99\t150\tcell1\n\
+                 chr1\t99\t160\tcell1\n\
+                 chr1\t99\t170\tcell1\n\
+                 chr1\t199\t250\tcell1\n\
+                 chr1\t99\t150\tcell2\n\
+                 chr1\t199\t250\tcell2\n\
+                 chr1\t199\t260\tcell2\n";
+    let (index, fragments, cells) = fixture("shrink_to_mean", &idx, frags, "cell1\ncell2\n")?;
+    let dir = index.parent().unwrap().to_path_buf();
+
+    let (m, cell_order, _, _) = fcount_core(&fragments, &index, &cells, 1, true)?;
+    assert_eq!(cell_order, vec!["cell1", "cell2"]);
+    assert_eq!((m[[0, 0]], m[[0, 1]]), (3, 1));
+    assert_eq!((m[[1, 0]], m[[1, 1]]), (1, 2));
+
+    let (lambda, p, r) = (10.0f64, 1.0f64, 1.0f64);
+    let lfc = |s: f64, c: f64| ((s + p) / (c / r + p)).log2();
+    let w = |s: f64, c: f64| {
+        let prec = (s + p) * (c + p * r) / (s + p + c + p * r);
+        prec / (prec + lambda)
+    };
+    let mu = lfc(4.0, 3.0);
+    let expect = |s: f64, c: f64, target: f64| w(s, c) * lfc(s, c) + (1.0 - w(s, c)) * target;
+
+    let read_scores = |path: &Path| -> io::Result<Vec<f64>> {
+        let text = std::fs::read_to_string(path)?;
+        let row = text.lines().nth(1).expect("one feature row");
+        Ok(row
+            .split(',')
+            .skip(1)
+            .map(|v| v.parse::<f64>().expect("numeric score"))
+            .collect())
+    };
+
+    let out_zero = dir.join("zero.csv");
+    bacha(
+        &fragments,
+        &index,
+        &cells,
+        &out_zero,
+        1,
+        10.0,
+        1.0,
+        ShrinkTarget::Zero,
+        FeatureNames::Name,
+        true,
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let got = read_scores(&out_zero)?;
+    for (g, want) in got
+        .iter()
+        .zip([expect(3.0, 1.0, 0.0), expect(1.0, 2.0, 0.0)])
+    {
+        assert!((g - want).abs() < 1e-3, "zero: got {g}, want {want}");
+    }
+
+    let out_mean = dir.join("mean.csv");
+    bacha(
+        &fragments,
+        &index,
+        &cells,
+        &out_mean,
+        1,
+        10.0,
+        1.0,
+        ShrinkTarget::Mean,
+        FeatureNames::Name,
+        true,
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let got = read_scores(&out_mean)?;
+    let want = [expect(3.0, 1.0, mu), expect(1.0, 2.0, mu)];
+    for (g, want) in got.iter().zip(want) {
+        assert!((g - want).abs() < 1e-3, "mean: got {g}, want {want}");
+    }
+    // The two targets must actually differ here, or the test proves nothing.
+    assert!((want[0] - expect(3.0, 1.0, 0.0)).abs() > 0.01);
+
+    std::fs::remove_dir_all(&dir)?;
     Ok(())
 }

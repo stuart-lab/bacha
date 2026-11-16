@@ -5,8 +5,13 @@ library(BSgenome.Hsapiens.UCSC.hg38)
 library(JASPAR2024)
 library(TFBSTools)
 
-# load open chromatin regions
-ocr <- read.table("https://downloads.wenglab.org/Registry-V4/GRCh38-cCREs.bed", sep = "\t")
+# load open chromatin regions. The wenglab server drops large HTTP/2
+# transfers, so fetch over HTTP/1.1 with retries (as the bacha-index builds do)
+ccre_file <- tempfile(fileext = ".bed")
+download.file("https://downloads.wenglab.org/Registry-V4/GRCh38-cCREs.bed",
+              destfile = ccre_file, method = "curl",
+              extra = "--http1.1 --retry 5 --retry-all-errors --fail -L")
+ocr <- read.table(ccre_file, sep = "\t")
 ocr <- makeGRangesFromDataFrame(ocr, seqnames.field = "V1", start.field = "V2", end.field = "V3")
 
 ah <- AnnotationHub()
@@ -33,6 +38,7 @@ BachaIndex(
   open_regions = ocr,
   mask_regions = mask_regions,
   output_path = "test/hg38_chr19_test.bi",
+  motif_set_name = "JASPAR2024",
   window = 50,
   n_background = 10
 )

@@ -24,12 +24,32 @@
 #' - Length-prefixed string (u16 LE length + UTF-8 bytes): genome name
 #' - Length-prefixed string: motif set name
 #' - 4 bytes (u32 LE): window size (bp)
-#' - 2 bytes (u16 LE): number of TFs (`n_tfs`)
-#' - 1 byte (u8): number of chromosomes (`n_chroms`)
+#' - 4 bytes (u32 LE): number of TFs (`n_tfs`)
+#' - 4 bytes (u32 LE): number of chromosomes (`n_chroms`)
 #'
-#' **TF names**
+#' **Build provenance**
 #'
-#' - `n_tfs` length-prefixed strings: TF names
+#' - 2 bytes (u16 LE): number of entries (may be 0)
+#' - For each entry: a length-prefixed key string then a length-prefixed value
+#'   string. Values are stored as text. `BachaIndex()` writes `build_date`
+#'   (UTC, ISO 8601), `bacha_version`, `r_version`, `input` (`"pwm"` or
+#'   `"positions"`), `match_features`, `n_background`, `mindist`,
+#'   `max_matches` and `p_cutoff` (motif scanning only), `gc_jitter_sd`,
+#'   `seed`, `exclude`, `bias` (file name, when used), the number of
+#'   `open_regions` and `mask_regions` supplied, and `genome_version` (the
+#'   BSgenome package version, when installed), followed by any `metadata`
+#'   entries. Readers ignore keys they do not recognise, so entries can be
+#'   added without changing the format version. `bacha view` and
+#'   `bacha summary` print them in a `##[build]` section.
+#'
+#' **Feature table**
+#'
+#' - For each of the `n_tfs` features: a length-prefixed ID string, then a
+#'   length-prefixed display name string. IDs are unique. For PWMs from
+#'   TFBSTools (including [Signac::ReadPWM()]) they are the matrix IDs and the
+#'   names are the matrix names; otherwise both come from the list names.
+#'   Names may repeat; `bacha count --feature-names` picks which is used to
+#'   label the output.
 #'
 #' **Instance counts**
 #'
@@ -40,32 +60,64 @@
 #'
 #' - For each chromosome: length-prefixed string (name) + u32 LE (length in bp)
 #'
+#' **Motif matrices**
+#'
+#' - 1 byte (u8): 1 if the index stores matrices, 0 if not (indexes built
+#'   from `positions`). When 1, for each feature:
+#'   - 1 byte (u8): value type, 0 = no matrix, 1 = counts, 2 = probabilities,
+#'     3 = log-odds (e.g. a TFBSTools `PWMatrix`), 4 = other
+#'   - 2 bytes (u16 LE): width (number of positions; 0 when there is no
+#'     matrix)
+#'   - `[f32 LE; 4 * width]`: values position by position, A, C, G, T within
+#'     each position
+#'
+#' Export them with `bacha motifs` or [IndexMotifs()].
+#'
+#' **Varint columns**
+#'
+#' Most position columns are stored as unsigned LEB128 varints: each value
+#' takes 1 to 5 bytes, 7 bits per byte, least significant group first, with
+#' the high bit of a byte set when another byte follows. Values never exceed
+#' 32 bits. A varint column starts with 8 bytes (u64 LE) giving its length in
+#' bytes, followed by exactly that many bytes encoding the column's values;
+#' the number of values comes from the block's row count.
+#'
 #' **Site positions** (sorted by chromosome then start)
 #'
 #' - 4 bytes (u32 LE): number of site rows (`n_sites`)
-#' - `[u8; n_sites]`: chromosome IDs (0-based index into chromosome table)
-#' - `[u32 LE; n_sites]`: start positions (1-based), delta-encoded within each
-#'   chromosome run. The first start of each chromosome is absolute;
-#'   subsequent starts within the same chromosome are differences from the
-#'   previous start. Reader recovers absolute starts via cumulative sum
-#'   reset at each chromosome boundary, then converts to 0-based half-open
-#'   intervals for fragment endpoint counting.
-#' - `[u16 LE; n_sites]`: TF indices (1-based index into TF names)
+#' - varint column, `n_sites` values: chromosome IDs (0-based index into the
+#'   chromosome table)
+#' - varint column, `n_sites` values: start positions (1-based),
+#'   delta-encoded within each chromosome run. The first start of each
+#'   chromosome is absolute; subsequent starts within the same chromosome
+#'   are differences from the previous start. Reader recovers absolute
+#'   starts via cumulative sum reset at each chromosome boundary, then
+#'   converts to 0-based half-open intervals for fragment endpoint counting.
+#' - varint column, `n_sites` values: TF indices (1-based index into TF
+#'   names)
 #'
 #' **Control positions** (sorted by chromosome then start)
 #'
 #' - 4 bytes (u32 LE): number of control rows (`n_ctrl`)
-#' - `[u8; n_ctrl]`: chromosome IDs
-#' - `[u32 LE; n_ctrl]`: 1-based start positions, delta-encoded within each
-#'   chromosome run (same scheme as site starts).
-#' - `[u16 LE; n_ctrl]`: number of TF associations per control (`n_per_row`)
+#' - varint column, `n_ctrl` values: chromosome IDs
+#' - varint column, `n_ctrl` values: 1-based start positions, delta-encoded
+#'   within each chromosome run (same scheme as site starts).
+#' - varint column, `n_ctrl` values: number of TF associations per control
+#'   (`n_per_row`)
 #' - 4 bytes (u32 LE): total number of TF index entries (`total_indices`)
-#' - `[u16 LE; total_indices]`: flattened TF indices for each control row,
-#'   delta-encoded within each row. Within a row the indices are sorted
-#'   ascending; the first index of each row is absolute and subsequent
-#'   indices are differences from the previous index. Each absolute index
-#'   is encoded as `tf_index + n_tfs` to distinguish controls from sites
-#'   in the shared ID space.
+#' - varint column, `total_indices` values: flattened TF indices for each
+#'   control row, delta-encoded within each row. Within a row the indices
+#'   are sorted ascending; the first index of each row is absolute and
+#'   subsequent indices are differences from the previous index. Each
+#'   absolute index is encoded as `tf_index + n_tfs` to distinguish controls
+#'   from sites in the shared ID space.
+#'
+#' **Trailing data**
+#'
+#' Readers stop after the control positions block and ignore anything that
+#' follows it. Optional sections can therefore be appended in future without
+#' changing the format version: files carrying them still load in older
+#' readers, which skip them.
 #'
 #' @param pwm A list of position weight matrices or position frequency matrices.
 #'   If provided, the `positions` argument should not be set.
@@ -75,6 +127,7 @@
 #'   `"meanBias"` or `"maxBias"`. See <https://zenodo.org/records/15224770>;
 #'   <https://doi.org/10.1038/s41586-024-08443-4>.
 #' @param open_regions A GRanges object containing open chromatin regions.
+#'   Strand is ignored.
 #' @param mask_regions A GRanges object containing regions to mask from the
 #'   motif scan (e.g. blacklist regions or repeat regions).
 #' @param output_path Path to write the output index file.
@@ -82,7 +135,8 @@
 #'   pre-computed genomic positions of interest for a set of features. Each
 #'   element should be a different feature (e.g. a TF motif or GWAS trait) and
 #'   the genomic regions correspond to regions relevant to that feature to
-#'   aggregate information across. If `positions` are supplied, `pwm` should
+#'   aggregate information across. Strand is ignored. If `positions` are
+#'   supplied, `pwm` should
 #'   not be provided and the motif scanning will be skipped.
 #' @param tss_positions A GRanges object giving genomic TSS positions. Required
 #'   if `"tssDist"` is included in `match_features`.
@@ -105,6 +159,12 @@
 #' @param motif_set_name Character string identifying the motif collection
 #'   (e.g. `"JASPAR2026"`, `"HOCOMOCO14"`). Stored in the index file header for
 #'   provenance tracking. If `NULL`, defaults to `"custom"`.
+#' @param metadata Optional named character vector (or named list of single
+#'   values) of extra provenance to store in the index's build block, such as
+#'   `c(motif_source = "https://jaspar.elixir.no/...")`. Names must be unique
+#'   and must not reuse a key `BachaIndex()` records itself; neither names nor
+#'   values may contain tabs or newlines. Shown by `bacha view`,
+#'   `bacha summary` and [IndexSummary()].
 #' @param p_cutoff p-value cutoff for motif matches.
 #' @param gc_jitter_sd Standard deviation of Gaussian jitter applied to GC
 #'   values during matching only (not stored in the index). For an `N`-bp
@@ -131,7 +191,7 @@
 #' @importFrom S4Vectors mcols mcols<- Rle endoapply queryHits
 #' @importFrom GenomeInfoDb seqlevels seqlevelsInUse keepSeqlevels dropSeqlevels
 #' @importFrom stats cov median rnorm setNames
-#' @importFrom BiocGenerics start<- end
+#' @importFrom BiocGenerics start<- end unstrand
 #' @importFrom withr local_seed
 #' 
 #' @export
@@ -188,6 +248,7 @@ BachaIndex <- function(
     motif_set_name = NULL,
     gc_jitter_sd = 0.5,
     seed = 1234,
+    metadata = NULL,
     verbose = TRUE
 ) {
   # Seed for the duration of this call only; the caller's RNG state is
@@ -243,6 +304,34 @@ BachaIndex <- function(
     stop("Requested output file already exists")
   }
   
+  # Record how this index was built, before the inputs below are filtered.
+  build_info <- index_build_info(
+    input = if (missing(x = pwm)) "positions" else "pwm",
+    match_features = match_features,
+    n_background = n_background,
+    mindist = mindist,
+    max_matches = if (missing(x = pwm)) NULL else max_matches,
+    p_cutoff = if (missing(x = pwm)) NULL else p_cutoff,
+    gc_jitter_sd = gc_jitter_sd,
+    seed = seed,
+    exclude = exclude,
+    # recorded only when matching uses it; an unused bias file is ignored
+    bias = if (bias_missing || !any(c("meanBias", "maxBias") %in% match_features)) {
+      NULL
+    } else {
+      bias
+    },
+    n_open_regions = length(x = open_regions),
+    n_mask_regions = if (missing(x = mask_regions)) NULL else length(x = mask_regions),
+    genome = genome
+  )
+  build_info <- add_build_metadata(build_info = build_info, metadata = metadata)
+
+  # An index is unstranded: sites, flanks and controls are plain positions,
+  # and the writer delta-encodes starts sorted by position alone. Stranded
+  # input would otherwise sort as all `+` then all `-` within a chromosome.
+  open_regions <- unstrand(x = open_regions)
+
   # Expand mask regions by `window` bp on each side. All motif sites, motif
   # flanks, and candidate controls are filtered against this padded mask.
   if (!missing(mask_regions)) {
@@ -285,7 +374,13 @@ BachaIndex <- function(
   }
   
   if (!missing(pwm)) {
-    names(x = pwm) <- normalize_feature_names(x = names(x = pwm), n = length(x = pwm))
+    # Features are keyed by a unique ID (the matrix ID where the PWM carries
+    # one, else the list name) and carry a display name and the matrix
+    # itself, which are stored in the index alongside the sites.
+    motif_info <- motif_metadata(pwm = pwm)
+    names(x = pwm) <- motif_info$id
+    feature_names <- motif_info$name
+    feature_matrices <- motif_info$matrix
     if (verbose) {
       message("Scanning genome for motif matches")
     }
@@ -411,10 +506,12 @@ BachaIndex <- function(
       x = names(x = positions),
       n = length(x = positions)
     )
+    feature_names <- setNames(object = names(x = positions), nm = names(x = positions))
+    feature_matrices <- NULL
     motif.names <- rep(
       x = names(x = positions), elementNROWS(x = positions)
     )
-    positions <- unlist(x = positions, use.names = FALSE)
+    positions <- unstrand(x = unlist(x = positions, use.names = FALSE))
     positions$motif <- motif.names
     # remove provided sites overlapping padded mask regions
     if (!missing(mask_regions)) {
@@ -856,8 +953,191 @@ BachaIndex <- function(
     n_controls = n_controls,
     genome = genome,
     extra_chroms = union(x = exclude, y = seqlevels(x = open_regions)),
-    motif_set_name = motif_set_name %||% "custom"
+    motif_set_name = motif_set_name %||% "custom",
+    build_info = build_info,
+    feature_names = feature_names,
+    matrices = feature_matrices
   )
+}
+
+# Matrix value types, in the order of their codes in the index (0-based).
+MATRIX_TYPES <- c("none", "counts", "probabilities", "logodds", "other")
+
+# Per-feature metadata for a set of PWMs: a unique ID, a display name and the
+# matrix (A/C/G/T rows) with its value type, each named by ID.
+#
+# TFBSTools matrices supply their own ID and name (read from the slots, so
+# TFBSTools need not be attached); for anything else both come from the list
+# names. A missing display name falls back to the ID. IDs are made unique
+# with `normalize_feature_names()`; display names may repeat.
+#' @importFrom methods is slot
+motif_metadata <- function(pwm) {
+  elems <- as.list(x = pwm)
+  n <- length(x = elems)
+  list_names <- names(x = pwm) %||% rep(x = NA_character_, times = n)
+  from_slot <- function(x, what) {
+    if (is(object = x, class2 = "XMatrix")) {
+      v <- slot(object = x, name = what)
+      if (length(x = v) == 1L && !is.na(x = v) && nzchar(x = v)) {
+        return(as.character(x = v))
+      }
+    }
+    NA_character_
+  }
+  ids <- vapply(X = elems, FUN = from_slot, FUN.VALUE = "", what = "ID")
+  ids[is.na(x = ids)] <- list_names[is.na(x = ids)]
+  ids <- normalize_feature_names(x = unname(ids), n = n)
+  disp <- vapply(X = elems, FUN = from_slot, FUN.VALUE = "", what = "name")
+  disp[is.na(x = disp)] <- list_names[is.na(x = disp)]
+  disp <- unname(disp)
+  disp[is.na(x = disp) | !nzchar(x = disp)] <- ids[is.na(x = disp) | !nzchar(x = disp)]
+  mats <- lapply(X = elems, FUN = motif_matrix)
+  list(
+    id = ids,
+    name = setNames(object = disp, nm = ids),
+    matrix = setNames(object = mats, nm = ids)
+  )
+}
+
+# A motif's matrix as A/C/G/T rows by position columns, with its value type,
+# or NULL when it cannot be read as one.
+motif_matrix <- function(x) {
+  type <- NULL
+  if (is(object = x, class2 = "PWMatrix")) {
+    type <- "logodds"
+  } else if (is(object = x, class2 = "ICMatrix")) {
+    type <- "other"
+  }
+  if (is(object = x, class2 = "XMatrix")) {
+    x <- slot(object = x, name = "profileMatrix")
+  }
+  if (!is.matrix(x = x) || !is.numeric(x = x) || nrow(x = x) != 4L || ncol(x = x) == 0L ||
+      ncol(x = x) > 65535L) {
+    return(NULL)
+  }
+  bases <- c("A", "C", "G", "T")
+  if (!is.null(x = rownames(x = x))) {
+    if (!setequal(x = toupper(x = rownames(x = x)), y = bases)) {
+      return(NULL)
+    }
+    x <- x[match(x = bases, table = toupper(x = rownames(x = x))), , drop = FALSE]
+  }
+  dimnames(x = x) <- list(bases, NULL)
+  if (is.null(x = type)) {
+    type <- if (anyNA(x = x)) {
+      "other"
+    } else if (any(x < 0)) {
+      "logodds"
+    } else if (all(abs(x = colSums(x = x) - 1) < 1e-3)) {
+      "probabilities"
+    } else if (all(x == round(x = x))) {
+      "counts"
+    } else {
+      "other"
+    }
+  }
+  list(type = type, values = x)
+}
+
+# Build provenance for the index header, as a named character vector of
+# key/value strings in the order they are written. Arguments that do not
+# apply to this build (NULL) are left out. `window` is not repeated here as
+# the header already carries it; `seed = NULL` is recorded as
+# "none" since an unseeded build is itself worth knowing about.
+#' @importFrom utils packageVersion
+index_build_info <- function(
+    input,
+    match_features,
+    n_background,
+    mindist,
+    max_matches,
+    p_cutoff,
+    gc_jitter_sd,
+    seed,
+    exclude,
+    bias,
+    n_open_regions,
+    n_mask_regions,
+    genome = NULL
+) {
+  collapse <- function(x) {
+    if (length(x = x) == 0L) "none" else paste(x, collapse = ",")
+  }
+  info <- list(
+    build_date = format(x = Sys.time(), format = "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    bacha_version = as.character(x = packageVersion(pkg = "bacha")),
+    r_version = paste(R.version$major, R.version$minor, sep = "."),
+    input = input,
+    match_features = collapse(x = match_features),
+    n_background = n_background,
+    mindist = mindist,
+    max_matches = max_matches,
+    p_cutoff = p_cutoff,
+    gc_jitter_sd = gc_jitter_sd,
+    seed = seed %||% "none",
+    exclude = collapse(x = exclude),
+    bias = if (is.null(x = bias)) NULL else basename(path = bias),
+    open_regions = n_open_regions,
+    mask_regions = n_mask_regions,
+    genome_version = genome_package_version(genome = genome)
+  )
+  info <- Filter(f = Negate(f = is.null), x = info)
+  vapply(X = info, FUN = function(v) format(x = v, digits = 15L), FUN.VALUE = "")
+}
+
+# Version of the BSgenome package `genome` comes from, or NULL when it is not
+# a BSgenome or its package is not installed.
+genome_package_version <- function(genome) {
+  if (!inherits(x = genome, what = "BSgenome")) {
+    return(NULL)
+  }
+  tryCatch(
+    expr = as.character(x = utils::packageVersion(pkg = genome@pkgname)),
+    error = function(e) NULL
+  )
+}
+
+# Append user-supplied `metadata` to the automatic build provenance. Checked
+# up front so a bad entry fails before any index-building work runs.
+add_build_metadata <- function(build_info, metadata) {
+  if (is.null(x = metadata) || length(x = metadata) == 0L) {
+    return(build_info)
+  }
+  keys <- names(x = metadata)
+  if (is.null(x = keys) || anyNA(x = keys) || any(keys == "")) {
+    stop("Every 'metadata' entry must be named", call. = FALSE)
+  }
+  if (!all(lengths(x = metadata) == 1L)) {
+    stop("Each 'metadata' entry must be a single value", call. = FALSE)
+  }
+  clash <- intersect(x = keys, y = names(x = build_info))
+  if (length(x = clash) > 0L) {
+    stop(
+      "'metadata' cannot reuse keys BachaIndex() records itself: ",
+      paste(clash, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  if (anyDuplicated(x = keys) > 0L) {
+    stop("'metadata' names must be unique", call. = FALSE)
+  }
+  values <- vapply(
+    X = metadata,
+    FUN = function(v) format(x = v, digits = 15L),
+    FUN.VALUE = ""
+  )
+  if (any(grepl(pattern = "[\t\r\n]", x = c(keys, values)))) {
+    stop("'metadata' names and values cannot contain tabs or newlines",
+         call. = FALSE)
+  }
+  # `bacha view` starts each build line with its key, and its readers treat
+  # a line starting with "#" as a header
+  if (any(startsWith(x = keys, prefix = "#"))) {
+    stop("'metadata' names cannot start with '#'", call. = FALSE)
+  }
+  out <- c(build_info, setNames(object = values, nm = keys))
+  check_build_info(x = out)
+  out
 }
 
 # Order the site windows so the two flanks of each site sit next to each other.
@@ -986,6 +1266,36 @@ open_bgzf_writer <- function(filename) {
   pipe(description = cmd, open = "wb")
 }
 
+# Validate build provenance before anything is written. `bacha view` prints
+# each entry as a `key<TAB>value` line, so neither part may contain a tab or
+# newline, and each must fit a u16 length prefix.
+check_build_info <- function(x) {
+  if (length(x = x) == 0L) {
+    return(invisible(x = NULL))
+  }
+  keys <- names(x = x)
+  if (!is.character(x = x) || is.null(x = keys) || anyNA(x = x) ||
+      any(!nzchar(x = keys)) || anyDuplicated(x = keys) > 0L) {
+    stop("'build_info' must be a character vector with unique, non-empty names",
+         call. = FALSE)
+  }
+  if (length(x = x) > 65535L) {
+    stop("'build_info' holds at most 65535 entries", call. = FALSE)
+  }
+  fields <- c(keys, unname(x))
+  if (any(grepl(pattern = "[\t\r\n]", x = fields))) {
+    stop("'build_info' keys and values cannot contain tabs or newlines",
+         call. = FALSE)
+  }
+  if (any(startsWith(x = keys, prefix = "#"))) {
+    stop("'build_info' keys cannot start with '#'", call. = FALSE)
+  }
+  if (any(nchar(x = fields, type = "bytes") > 65535L)) {
+    stop("'build_info' keys and values must be under 64 KB each", call. = FALSE)
+  }
+  invisible(x = NULL)
+}
+
 # Write index in custom binary format
 # Format: BACH magic (4 bytes) + version (u8) + header + columnar data,
 # BGZF (Blocked GZIP) compressed via the htslib `bgzip` command. Position
@@ -1007,8 +1317,13 @@ write_index <- function(
     n_controls,
     genome,
     motif_set_name,
-    extra_chroms = character(0)
+    extra_chroms = character(0),
+    build_info = character(0),
+    feature_names = NULL,
+    matrices = NULL
 ) {
+  check_build_info(x = build_info)
+
   # extract genome name from BSgenome object
   genome_name <- if (inherits(x = genome, what = "BSgenome")) {
     genome@pkgname
@@ -1035,17 +1350,27 @@ write_index <- function(
   # TF names and 1-based indices
   tf_names <- names(x = n_motif)
   n_tfs <- length(x = tf_names)
-  # Feature indices are written as u16, and controls are stored as
-  # `tf_index + n_tfs`, so the largest value written is 2 * n_tfs.
   if (n_tfs == 0L) {
     stop("No features to write to the index", call. = FALSE)
   }
-  if (2L * n_tfs > 65535L) {
-    stop("Index format supports at most ", 65535L %/% 2L, " features, got ",
-         n_tfs, call. = FALSE)
-  }
   motif_index <- seq_len(length.out = n_tfs)
   names(x = motif_index) <- tf_names
+
+  # Display names, by feature ID; a feature without one is shown by its ID.
+  display_names <- unname(feature_names[tf_names])
+  if (length(x = display_names) != n_tfs) {
+    display_names <- rep(x = NA_character_, times = n_tfs)
+  }
+  display_names[is.na(x = display_names)] <- tf_names[is.na(x = display_names)]
+  # `bacha view` prints IDs and names as tab-separated text
+  if (any(grepl(pattern = "[\t\r\n]", x = c(tf_names, display_names)))) {
+    stop("Feature IDs and names cannot contain tabs or newlines", call. = FALSE)
+  }
+  # `bacha view` starts feature, site and control lines with the feature ID,
+  # and its readers treat a line starting with "#" as a header
+  if (any(startsWith(x = tf_names, prefix = "#"))) {
+    stop("Feature IDs cannot start with '#'", call. = FALSE)
+  }
 
   # get chromosome sizes from the genome
   all_lengths <- seqlengths(x = genome)
@@ -1076,17 +1401,6 @@ write_index <- function(
     x = intersect(x = names(x = all_lengths), y = extra_chroms),
     y = chroms_used
   )
-  n_room <- 255L - length(x = chroms_used)
-  if (length(x = extra_chroms) > n_room) {
-    warning(
-      "The chromosome table holds at most 255 entries; omitting ",
-      length(x = extra_chroms) - max(n_room, 0L),
-      " region-free chromosome(s). Fragments on those chromosomes will be ",
-      "reported as absent from the index.",
-      call. = FALSE
-    )
-    extra_chroms <- if (n_room > 0L) extra_chroms[seq_len(n_room)] else character(0)
-  }
 
   # Keep the genome's own seqlevel order across the whole table.
   chrom_names <- names(x = all_lengths)[
@@ -1095,10 +1409,6 @@ write_index <- function(
   chrom_lengths <- all_lengths[chrom_names]
 
   n_chroms <- length(x = chrom_names)
-  if (n_chroms > 255L) {
-    stop("Index format supports at most 255 chromosomes, got ", n_chroms,
-         ". Consider filtering scaffolds with the 'exclude' parameter.")
-  }
   chrom_to_id <- setNames(
     object = seq_along(along.with = chrom_names) - 1L,
     nm = chrom_names
@@ -1124,11 +1434,21 @@ write_index <- function(
   write_string(genome_name, con)
   write_string(motif_set_name, con)
   writeBin(as.integer(x = win), con, size = 4L, endian = "little")
-  writeBin(as.integer(x = n_tfs), con, size = 2L, endian = "little")
-  writeBin(as.integer(x = n_chroms), con, size = 1L)
+  writeBin(as.integer(x = n_tfs), con, size = 4L, endian = "little")
+  writeBin(as.integer(x = n_chroms), con, size = 4L, endian = "little")
 
-  # TF names
-  for (tf in tf_names) write_string(tf, con)
+  # build provenance: entry count, then key/value string pairs
+  writeBin(length(x = build_info), con, size = 2L, endian = "little")
+  for (key in names(x = build_info)) {
+    write_string(key, con)
+    write_string(build_info[[key]], con)
+  }
+
+  # feature table: ID then display name for each feature
+  for (i in seq_len(length.out = n_tfs)) {
+    write_string(tf_names[i], con)
+    write_string(display_names[i], con)
+  }
 
   # instance counts: site_counts [u32; n_tfs] then control_counts [u32; n_tfs]
   writeBin(as.integer(x = n_motif), con, size = 4L, endian = "little")
@@ -1138,6 +1458,25 @@ write_index <- function(
   for (i in seq_along(along.with = chrom_names)) {
     write_string(chrom_names[i], con)
     writeBin(as.integer(x = chrom_lengths[i]), con, size = 4L, endian = "little")
+  }
+
+  # matrix section: presence flag, then per feature a type code, a width and
+  # the values position by position (A, C, G, T within each position)
+  if (is.null(x = matrices)) {
+    writeBin(0L, con, size = 1L)
+  } else {
+    writeBin(1L, con, size = 1L)
+    for (tf in tf_names) {
+      m <- matrices[[tf]]
+      if (is.null(x = m)) {
+        writeBin(0L, con, size = 1L)
+        writeBin(0L, con, size = 2L, endian = "little")
+        next
+      }
+      writeBin(match(x = m$type, table = MATRIX_TYPES) - 1L, con, size = 1L)
+      writeBin(ncol(x = m$values), con, size = 2L, endian = "little")
+      writeBin(as.numeric(x = m$values), con, size = 4L, endian = "little")
+    }
   }
 
   # sort motifs by chromosome then start
@@ -1152,9 +1491,9 @@ write_index <- function(
   site_tf_idx <- as.integer(x = motif_index[motifs$motif])
   site_starts_delta <- delta_per_chrom(chroms = site_chroms, starts = site_starts)
 
-  writeBin(site_chroms, con, size = 1L)
-  writeBin(site_starts_delta, con, size = 4L, endian = "little")
-  writeBin(site_tf_idx, con, size = 2L, endian = "little")
+  write_varint_column(con = con, x = site_chroms)
+  write_varint_column(con = con, x = site_starts_delta)
+  write_varint_column(con = con, x = site_tf_idx)
 
   # Sort controls by chromosome then start
   controls$.motif_id_idx <- seq_along(controls)
@@ -1181,9 +1520,9 @@ write_index <- function(
   }
   ctrl_starts_delta <- delta_per_chrom(chroms = ctrl_chroms, starts = ctrl_starts)
 
-  writeBin(ctrl_chroms, con, size = 1L)
-  writeBin(ctrl_starts_delta, con, size = 4L, endian = "little")
-  writeBin(n_per_row, con, size = 2L, endian = "little")
+  write_varint_column(con = con, x = ctrl_chroms)
+  write_varint_column(con = con, x = ctrl_starts_delta)
+  write_varint_column(con = con, x = n_per_row)
   writeBin(as.integer(x = total_indices), con, size = 4L, endian = "little")
   write_ctrl_indices(
     con = con,
@@ -1196,38 +1535,106 @@ write_index <- function(
   invisible(x = filename)
 }
 
-# Write the flattened, within-row delta encoded control index stream in batches
-# of whole rows.
+# Write the flattened, within-row delta encoded control index stream as one
+# varint column, in batches of whole rows.
 #
 # `motif_id` is in unsorted control order; `ctrl_order` maps sorted row -> the
-# original row, and `n_per_row` is already in sorted order.
+# original row, and `n_per_row` is already in sorted order. The column's byte
+# length precedes it, so the batches are walked twice: once to size the
+# column, once to write it.
 write_ctrl_indices <- function(con, motif_id, ctrl_order, n_per_row,
                                max_batch = 2e7) {
   n_rows <- length(x = n_per_row)
-  if (n_rows == 0L) {
-    return(invisible(NULL))
-  }
   # cumulative entry count so batch edges can be found without scanning
   cum <- cumsum(as.double(x = n_per_row))
-  start_row <- 1L
-  while (start_row <= n_rows) {
-    base <- if (start_row == 1L) 0 else cum[start_row - 1L]
-    end_row <- findInterval(x = base + max_batch, vec = cum)
-    # a single row wider than the batch budget still has to go out on its own
-    if (end_row < start_row) {
-      end_row <- start_row
+  for_each_batch <- function(f) {
+    start_row <- 1L
+    while (start_row <= n_rows) {
+      base <- if (start_row == 1L) 0 else cum[start_row - 1L]
+      end_row <- findInterval(x = base + max_batch, vec = cum)
+      # a single row wider than the batch budget still has to go out on its own
+      if (end_row < start_row) {
+        end_row <- start_row
+      }
+      rows <- seq.int(from = start_row, to = end_row)
+      vals <- as.integer(
+        x = unlist(x = motif_id[ctrl_order[rows]], use.names = FALSE)
+      )
+      f(delta_within_row(x = vals, n_per_row = n_per_row[rows]))
+      start_row <- end_row + 1L
     }
-    rows <- seq.int(from = start_row, to = end_row)
-    vals <- as.integer(
-      x = unlist(x = motif_id[ctrl_order[rows]], use.names = FALSE)
+  }
+  n_bytes <- 0
+  for_each_batch(f = function(d) n_bytes <<- n_bytes + varint_nbytes(x = d))
+  write_u64(con = con, x = n_bytes)
+  for_each_batch(f = function(d) writeBin(encode_varint(x = d), con))
+  invisible(NULL)
+}
+
+# Total number of bytes `x` takes as unsigned LEB128 varints. `x` must be
+# non-negative and below 2^31 (R integers); varints of up to 5 bytes would
+# hold any u32.
+varint_nbytes <- function(x) {
+  check_varint_values(x = x)
+  # double arithmetic: a long column's byte count can exceed integer range
+  as.double(x = length(x = x)) + sum(x >= 128L) + sum(x >= 16384L) + sum(x >= 2097152L) +
+    sum(x >= 268435456L)
+}
+
+check_varint_values <- function(x) {
+  if (anyNA(x = x) || any(x < 0L)) {
+    stop(
+      "Index columns must hold non-negative values; positions or control ",
+      "feature indices are out of order",
+      call. = FALSE
     )
-    writeBin(
-      delta_within_row(x = vals, n_per_row = n_per_row[rows]),
-      con,
-      size = 2L,
-      endian = "little"
-    )
-    start_row <- end_row + 1L
+  }
+}
+
+# Encode `x` as unsigned LEB128 varints: 7 bits per byte, least significant
+# group first, high bit set on every byte except a value's last.
+encode_varint <- function(x) {
+  x <- as.integer(x = x)
+  check_varint_values(x = x)
+  if (length(x = x) == 0L) {
+    return(raw(length = 0L))
+  }
+  nb <- 1L + (x >= 128L) + (x >= 16384L) + (x >= 2097152L) + (x >= 268435456L)
+  ends <- cumsum(x = as.double(x = nb))
+  out <- raw(length = ends[length(x = ends)])
+  first <- ends - nb
+  for (j in 0:4) {
+    m <- which(x = nb > j)
+    if (length(x = m) == 0L) {
+      break
+    }
+    byte <- bitwAnd(a = bitwShiftR(a = x[m], n = 7L * j), b = 127L)
+    more <- nb[m] > j + 1L
+    byte[more] <- byte[more] + 128L
+    out[first[m] + j + 1] <- as.raw(x = byte)
+  }
+  out
+}
+
+# Write a non-negative whole number below 2^53 as a u64 LE.
+write_u64 <- function(con, x) {
+  halves <- c(x %% 2^32, x %/% 2^32)
+  # writeBin takes signed 32-bit integers; reinterpret each half
+  halves[halves >= 2^31] <- halves[halves >= 2^31] - 2^32
+  writeBin(as.integer(x = halves), con, size = 4L, endian = "little")
+}
+
+# Write `x` as a varint column: its byte length (u64 LE), then the values.
+# Encoded in chunks to bound memory on long columns.
+write_varint_column <- function(con, x, chunk = 1e7) {
+  x <- as.integer(x = x)
+  write_u64(con = con, x = varint_nbytes(x = x))
+  n <- length(x = x)
+  from <- 1
+  while (from <= n) {
+    to <- min(from + chunk - 1, n)
+    writeBin(encode_varint(x = x[from:to]), con)
+    from <- to + 1
   }
   invisible(NULL)
 }

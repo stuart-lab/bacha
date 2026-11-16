@@ -115,6 +115,7 @@ Bias-adjusted aggregation of chromatin accessibility data
 
 * `count` — Count Tn5 insertions and compute activity scores
 * `view` — View index file contents in plain text
+* `motifs` — Export the motif matrices stored in an index, in JASPAR format
 * `summary` — Print summary information about an index file (header + per-TF site and control counts) without reading the site position blocks
 
 
@@ -141,6 +142,26 @@ Count Tn5 insertions and compute activity scores
 * `-p`, `--pseudocount <PSEUDOCOUNT>` — Pseudocount added to counts before log fold change calculation to avoid log(0)
 
   Default value: `1`
+* `--shrink-to <SHRINK_TO>` — Shrinkage target. `zero` (default) is the posterior mean under a prior centred on no enrichment, so every score is pulled toward 0 by 1 - prec / (prec + lambda). `mean` centres the prior on each feature's pseudobulk log2 fold change, computed from the counts summed over every scored cell.
+
+  Default value: `zero`
+
+  Possible values:
+  - `zero`:
+    Shrink toward a log fold change of 0
+  - `mean`:
+    Shrink toward the feature's pseudobulk log fold change over all scored cells
+
+* `--feature-names <FEATURE_NAMES>` — Label for each feature (row) in the output. `name` (default) uses the display name stored in the index, such as a TF gene symbol; when several features share a name, each of them is written as `NAME (ID)` so rows stay unique. `id` uses the feature's unique ID, such as a JASPAR matrix ID.
+
+  Default value: `name`
+
+  Possible values:
+  - `name`:
+    The feature's display name (e.g. a gene symbol). A name shared by several features gets the ID appended to each, as `NAME (ID)`, so every row stays unique
+  - `id`:
+    The feature's unique ID (e.g. a JASPAR matrix ID)
+
 * `--no-bounds-check` — Disable the genome/assembly mismatch check. By default the run aborts on the first fragment coordinate that lies beyond the end of its chromosome in the index (an impossible position unless the fragment file and index were built on different genome assemblies). Pass this flag to skip the check and process such coordinates anyway.
 
 
@@ -158,6 +179,18 @@ View index file contents in plain text
 ###### **Options:**
 
 * `-H`, `--header-only` — Print header information only
+
+
+
+#### `bacha motifs`
+
+Export the motif matrices stored in an index, in JASPAR format. Each record's header line is `>ID<TAB>NAME<TAB>TYPE`, where TYPE is the value type of the matrix as given to the index builder: counts, probabilities, logodds or other. Features without a matrix are left out.
+
+**Usage:** `bacha motifs <INDEX>`
+
+###### **Arguments:**
+
+* `<INDEX>` — Bacha index file
 
 
 

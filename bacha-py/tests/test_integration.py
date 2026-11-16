@@ -62,7 +62,9 @@ def test_summary_runs(barcodes):
     assert info["genome"] == "BSgenome.Hsapiens.UCSC.hg38"
     assert info["motif_set"] == "JASPAR2024"
     assert info["window"] == 50
-    assert info["chromosomes"] == [("chr19", 58617616)]
+    # Sites are on chr19 only, but the table also lists chromosomes without
+    # sites so a fragment file from another assembly is still detected.
+    assert ("chr19", 58617616) in info["chromosomes"]
     assert len(info["sites"]) == 5
     assert len(info["controls"]) == 5
     assert [s[0] for s in info["sites"]] == [c[0] for c in info["controls"]]

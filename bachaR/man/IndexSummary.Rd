@@ -13,7 +13,8 @@ IndexSummary(index, bacha.path = NULL, return.table = FALSE)
 on the system PATH.}
 
 \item{return.table}{Logical. If \code{TRUE}, invisibly return a data frame
-with columns \code{tf} and \code{n_sites} in addition to printing the summary.
+with columns \code{tf} (feature ID), \code{name} (display name) and \code{n_sites} in
+addition to printing the summary.
 Default: \code{FALSE}.}
 }
 \value{
@@ -21,8 +22,9 @@ Invisibly, \code{NULL} (or a data frame if \code{return.table = TRUE}).
 }
 \description{
 Prints a summary of a Bacha index file: format version, genome and motif
-set, window size, number of chromosomes covered, number of TFs, and a
-summary of the per-TF number of motif sites. Optionally returns a data
+set, window size, how the index was built (date and \code{\link[=BachaIndex]{BachaIndex()}}
+parameters), number of chromosomes covered, number of TFs, and a summary
+of the per-TF number of motif sites. Optionally returns a data
 frame of TF site counts.
 }
 \details{

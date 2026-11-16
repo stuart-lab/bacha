@@ -30,9 +30,13 @@
 #' per-bp rate, giving \eqn{p} pseudo-observations on the site footprint and
 #' \eqn{p r} pseudo-observations on the (larger) control footprint. `prec` is
 #' the resulting posterior precision of the LFC, so the weight is the standard
-#' Bayesian posterior shrinkage toward zero under a Normal prior on
-#' log-enrichment with prior precision \eqn{\lambda}. Larger values of
-#' `lambda` give more aggressive shrinkage. Under this parameterisation, one-
+#' Bayesian posterior shrinkage under a Normal prior on log-enrichment with
+#' prior precision \eqn{\lambda}. Larger values of `lambda` give more
+#' aggressive shrinkage. By default the prior is centred on zero; with
+#' `shrink.to = "mean"` it is centred on each feature's pseudobulk LFC over
+#' all scored cells, \eqn{S = w \cdot \text{LFC} + (1 - w) \cdot \mu}, so
+#' that a feature whose null LFC sits away from zero is not pulled toward zero
+#' by a depth-dependent amount. Under this parameterisation, one-
 #' sided evidence (e.g. many site insertions and no control insertions) still
 #' receives non-zero weight scaling with the control window size, since the
 #' control exposure itself is informative about the absence of insertions.

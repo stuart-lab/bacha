@@ -23,6 +23,7 @@ BachaIndex(
   motif_set_name = NULL,
   gc_jitter_sd = 0.5,
   seed = 1234,
+  metadata = NULL,
   verbose = TRUE
 )
 }
@@ -32,7 +33,8 @@ If provided, the \code{positions} argument should not be set.}
 
 \item{genome}{A BSgenome object.}
 
-\item{open_regions}{A GRanges object containing open chromatin regions.}
+\item{open_regions}{A GRanges object containing open chromatin regions.
+Strand is ignored.}
 
 \item{mask_regions}{A GRanges object containing regions to mask from the
 motif scan (e.g. blacklist regions or repeat regions).}
@@ -43,7 +45,8 @@ motif scan (e.g. blacklist regions or repeat regions).}
 pre-computed genomic positions of interest for a set of features. Each
 element should be a different feature (e.g. a TF motif or GWAS trait) and
 the genomic regions correspond to regions relevant to that feature to
-aggregate information across. If \code{positions} are supplied, \code{pwm} should
+aggregate information across. Strand is ignored. If \code{positions} are
+supplied, \code{pwm} should
 not be provided and the motif scanning will be skipped.}
 
 \item{tss_positions}{A GRanges object giving genomic TSS positions. Required
@@ -99,6 +102,13 @@ different indexes unless a seed is fixed. The seed is applied with
 \code{\link[withr:local_seed]{withr::local_seed()}}, so the caller's random number state is restored
 when \code{BachaIndex()} returns.}
 
+\item{metadata}{Optional named character vector (or named list of single
+values) of extra provenance to store in the index's build block, such as
+\code{c(motif_source = "https://jaspar.elixir.no/...")}. Names must be unique
+and must not reuse a key \code{BachaIndex()} records itself; neither names nor
+values may contain tabs or newlines. Shown by \verb{bacha view},
+\verb{bacha summary} and \code{\link[=IndexSummary]{IndexSummary()}}.}
+
 \item{verbose}{Display messages.}
 }
 \description{
@@ -127,13 +137,34 @@ user's PATH.
 \item Length-prefixed string (u16 LE length + UTF-8 bytes): genome name
 \item Length-prefixed string: motif set name
 \item 4 bytes (u32 LE): window size (bp)
-\item 2 bytes (u16 LE): number of TFs (\code{n_tfs})
-\item 1 byte (u8): number of chromosomes (\code{n_chroms})
+\item 4 bytes (u32 LE): number of TFs (\code{n_tfs})
+\item 4 bytes (u32 LE): number of chromosomes (\code{n_chroms})
 }
 
-\strong{TF names}
+\strong{Build provenance}
 \itemize{
-\item \code{n_tfs} length-prefixed strings: TF names
+\item 2 bytes (u16 LE): number of entries (may be 0)
+\item For each entry: a length-prefixed key string then a length-prefixed value
+string. Values are stored as text. \code{BachaIndex()} writes \code{build_date}
+(UTC, ISO 8601), \code{bacha_version}, \code{r_version}, \code{input} (\code{"pwm"} or
+\code{"positions"}), \code{match_features}, \code{n_background}, \code{mindist},
+\code{max_matches} and \code{p_cutoff} (motif scanning only), \code{gc_jitter_sd},
+\code{seed}, \code{exclude}, \code{bias} (file name, when used), the number of
+\code{open_regions} and \code{mask_regions} supplied, and \code{genome_version} (the
+BSgenome package version, when installed), followed by any \code{metadata}
+entries. Readers ignore keys they do not recognise, so entries can be
+added without changing the format version. \verb{bacha view} and
+\verb{bacha summary} print them in a \verb{##[build]} section.
+}
+
+\strong{Feature table}
+\itemize{
+\item For each of the \code{n_tfs} features: a length-prefixed ID string, then a
+length-prefixed display name string. IDs are unique. For PWMs from
+TFBSTools (including \code{\link[Signac:ReadPWM]{Signac::ReadPWM()}}) they are the matrix IDs and the
+names are the matrix names; otherwise both come from the list names.
+Names may repeat; \verb{bacha count --feature-names} picks which is used to
+label the output.
 }
 
 \strong{Instance counts}
@@ -147,34 +178,69 @@ user's PATH.
 \item For each chromosome: length-prefixed string (name) + u32 LE (length in bp)
 }
 
+\strong{Motif matrices}
+\itemize{
+\item 1 byte (u8): 1 if the index stores matrices, 0 if not (indexes built
+from \code{positions}). When 1, for each feature:
+\itemize{
+\item 1 byte (u8): value type, 0 = no matrix, 1 = counts, 2 = probabilities,
+3 = log-odds (e.g. a TFBSTools \code{PWMatrix}), 4 = other
+\item 2 bytes (u16 LE): width (number of positions; 0 when there is no
+matrix)
+\item \verb{[f32 LE; 4 * width]}: values position by position, A, C, G, T within
+each position
+}
+}
+
+Export them with \verb{bacha motifs} or \code{\link[=IndexMotifs]{IndexMotifs()}}.
+
+\strong{Varint columns}
+
+Most position columns are stored as unsigned LEB128 varints: each value
+takes 1 to 5 bytes, 7 bits per byte, least significant group first, with
+the high bit of a byte set when another byte follows. Values never exceed
+32 bits. A varint column starts with 8 bytes (u64 LE) giving its length in
+bytes, followed by exactly that many bytes encoding the column's values;
+the number of values comes from the block's row count.
+
 \strong{Site positions} (sorted by chromosome then start)
 \itemize{
 \item 4 bytes (u32 LE): number of site rows (\code{n_sites})
-\item \verb{[u8; n_sites]}: chromosome IDs (0-based index into chromosome table)
-\item \verb{[u32 LE; n_sites]}: start positions (1-based), delta-encoded within each
-chromosome run. The first start of each chromosome is absolute;
-subsequent starts within the same chromosome are differences from the
-previous start. Reader recovers absolute starts via cumulative sum
-reset at each chromosome boundary, then converts to 0-based half-open
-intervals for fragment endpoint counting.
-\item \verb{[u16 LE; n_sites]}: TF indices (1-based index into TF names)
+\item varint column, \code{n_sites} values: chromosome IDs (0-based index into the
+chromosome table)
+\item varint column, \code{n_sites} values: start positions (1-based),
+delta-encoded within each chromosome run. The first start of each
+chromosome is absolute; subsequent starts within the same chromosome
+are differences from the previous start. Reader recovers absolute
+starts via cumulative sum reset at each chromosome boundary, then
+converts to 0-based half-open intervals for fragment endpoint counting.
+\item varint column, \code{n_sites} values: TF indices (1-based index into TF
+names)
 }
 
 \strong{Control positions} (sorted by chromosome then start)
 \itemize{
 \item 4 bytes (u32 LE): number of control rows (\code{n_ctrl})
-\item \verb{[u8; n_ctrl]}: chromosome IDs
-\item \verb{[u32 LE; n_ctrl]}: 1-based start positions, delta-encoded within each
-chromosome run (same scheme as site starts).
-\item \verb{[u16 LE; n_ctrl]}: number of TF associations per control (\code{n_per_row})
+\item varint column, \code{n_ctrl} values: chromosome IDs
+\item varint column, \code{n_ctrl} values: 1-based start positions, delta-encoded
+within each chromosome run (same scheme as site starts).
+\item varint column, \code{n_ctrl} values: number of TF associations per control
+(\code{n_per_row})
 \item 4 bytes (u32 LE): total number of TF index entries (\code{total_indices})
-\item \verb{[u16 LE; total_indices]}: flattened TF indices for each control row,
-delta-encoded within each row. Within a row the indices are sorted
-ascending; the first index of each row is absolute and subsequent
-indices are differences from the previous index. Each absolute index
-is encoded as \code{tf_index + n_tfs} to distinguish controls from sites
-in the shared ID space.
+\item varint column, \code{total_indices} values: flattened TF indices for each
+control row, delta-encoded within each row. Within a row the indices
+are sorted ascending; the first index of each row is absolute and
+subsequent indices are differences from the previous index. Each
+absolute index is encoded as \code{tf_index + n_tfs} to distinguish controls
+from sites in the shared ID space.
 }
+
+\strong{Trailing data}
+
+Readers stop after the control positions block and ignore anything that
+follows it. Optional sections can therefore be appended in future without
+changing the format version: files carrying them still load in older
+readers, which skip them.
 }
 
 \examples{

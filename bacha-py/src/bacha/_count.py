@@ -69,6 +69,8 @@ def count(
     | None = None,
     lambda_: float = 10.0,
     pseudocount: float = 1.0,
+    shrink_to: str = "zero",
+    feature_names: str = "name",
     threads: int = 6,
     check_bounds: bool = True,
     bacha_path: str | Path | None = None,
@@ -111,6 +113,19 @@ def count(
         Shrinkage strength passed to ``bacha count -l``. Default 10.0.
     pseudocount
         Log-zero guard passed to ``bacha count -p``. Default 1.0.
+    shrink_to
+        Where shrinkage pulls each score (``bacha count --shrink-to``).
+        ``"zero"`` (default) pulls every score toward 0 by ``1 - w``.
+        ``"mean"`` centres the prior on each motif's pseudobulk log2 fold
+        change over all scored cells, giving ``w * LFC + (1 - w) * mean``, so
+        a motif whose null log fold change sits away from 0 is not pulled
+        toward 0 by a depth-dependent amount.
+    feature_names
+        How each motif is labelled in the output (``bacha count
+        --feature-names``). ``"name"`` (default) uses the display name stored
+        in the index, such as a TF gene symbol; motifs that share a name are
+        each labelled ``"NAME (ID)"``. ``"id"`` uses each motif's unique ID,
+        such as a JASPAR matrix ID.
     threads
         Total threads for the CLI (``-t``). Against a bgzip-compressed fragment
         file 2 of them inflate it and the rest count it, so the two pools share
@@ -250,6 +265,8 @@ def count(
                 outfile=outfile_path,
                 lambda_=lambda_,
                 pseudocount=pseudocount,
+                shrink_to=shrink_to,
+                feature_names=feature_names,
                 threads=threads,
                 check_bounds=check_bounds,
             )
@@ -261,6 +278,8 @@ def count(
                 outfile=outfile_path,
                 lambda_=lambda_,
                 pseudocount=pseudocount,
+                shrink_to=shrink_to,
+                feature_names=feature_names,
                 threads=threads,
                 check_bounds=check_bounds,
             )

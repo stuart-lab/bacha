@@ -21,6 +21,11 @@ def summary(
     - ``genome`` (str): genome assembly name.
     - ``motif_set`` (str): motif collection identifier.
     - ``window`` (int): site window size.
+    - ``matrices`` (int): number of features with a stored motif matrix.
+    - ``features`` (list[tuple[str, str]]): (id, display name) pairs.
+    - ``build`` (dict[str, str]): build provenance (date, ``BachaIndex()``
+      parameters, versions) as written by the index builder; values are
+      strings. Empty if the index records none.
     - ``chromosomes`` (list[tuple[str, int]]): (name, size) pairs.
     - ``sites`` (list[tuple[str, int, int]]): (motif_id, column_index, count).
     - ``controls`` (list[tuple[str, int, int]]): same shape as ``sites``.
@@ -45,6 +50,9 @@ def _parse(text: str) -> dict:
         "genome": None,
         "motif_set": None,
         "window": None,
+        "matrices": None,
+        "features": [],
+        "build": {},
         "chromosomes": [],
         "sites": [],
         "controls": [],
@@ -67,6 +75,15 @@ def _parse(text: str) -> dict:
         if line.startswith("## window:"):
             result["window"] = int(line.split(":", 1)[1].strip())
             continue
+        if line.startswith("## matrices:"):
+            result["matrices"] = int(line.split(":", 1)[1].strip())
+            continue
+        if line.startswith("##[features]"):
+            section = "features"
+            continue
+        if line.startswith("##[build]"):
+            section = "build"
+            continue
         if line.startswith("##[chromosome sizes]"):
             section = "chromosomes"
             continue
@@ -78,8 +95,16 @@ def _parse(text: str) -> dict:
             continue
         if line.startswith("#"):
             continue
+        if section == "build":
+            # split the unstripped line so an empty value survives
+            key, sep, value = raw.rstrip("\r\n").partition("\t")
+            if sep:
+                result["build"][key] = value
+            continue
         parts = line.split("\t")
-        if section == "chromosomes" and len(parts) == 2:
+        if section == "features" and len(parts) == 2:
+            result["features"].append((parts[0], parts[1]))
+        elif section == "chromosomes" and len(parts) == 2:
             result["chromosomes"].append((parts[0], int(parts[1])))
         elif section in ("sites", "controls") and len(parts) == 3:
             result[section].append((parts[0], int(parts[1]), int(parts[2])))

@@ -18,6 +18,8 @@
   index,
   lambda = 10,
   pseudocount = 1,
+  shrink.to = c("zero", "mean"),
+  feature.names = c("name", "id"),
   threads = 6,
   check.bounds = TRUE,
   bacha.path = NULL,
@@ -107,11 +109,26 @@ a path to a fragment file.}
 precision-based shrinkage weight \code{prec / (prec + lambda)}, where
 \code{prec = (s + p)(c + p*r) / (s + c + p + p*r)} is the exposure-consistent
 posterior precision of the LFC under a Gamma(p, .) prior on each per-bp
-rate. Larger values give stronger shrinkage toward zero. Default: 10.}
+rate. Larger values give stronger shrinkage toward the target set by
+\code{shrink.to}. Default: 10.}
 
 \item{pseudocount}{Numeric. Small constant added to counts before log fold
 change calculation to avoid \code{log(0)}. Shrinkage is handled by the
 precision weight, so this only needs to be a numerical guard. Default: 1.}
+
+\item{shrink.to}{Where shrinkage pulls each score. \code{"zero"} (the
+default) is the posterior mean under a prior centred on no enrichment, so
+every score is pulled toward 0 by \code{1 - w}. \code{"mean"} centres the
+prior on each feature's pseudobulk log2 fold change, computed from the
+counts summed over every scored cell, giving
+\code{w * LFC + (1 - w) * mean}. Passed to bacha as \code{--shrink-to}.}
+
+\item{feature.names}{How to label each feature (row) of the score
+matrix. \code{"name"} (the default) uses the display name stored in the
+index, such as a TF gene symbol; features that share a name are each
+labelled \code{"NAME (ID)"} so that rows stay unique. \code{"id"} uses each
+feature's unique ID, such as a JASPAR matrix ID. Passed to bacha as
+\code{--feature-names}.}
 
 \item{threads}{Integer. Total number of threads to use, passed to bacha as
 \code{-t}. Against a bgzip-compressed fragment file, 2 of them inflate the
@@ -181,9 +198,13 @@ The pseudocount \eqn{p} corresponds to a Gamma\eqn{(p, \cdot)} prior on each
 per-bp rate, giving \eqn{p} pseudo-observations on the site footprint and
 \eqn{p r} pseudo-observations on the (larger) control footprint. \code{prec} is
 the resulting posterior precision of the LFC, so the weight is the standard
-Bayesian posterior shrinkage toward zero under a Normal prior on
-log-enrichment with prior precision \eqn{\lambda}. Larger values of
-\code{lambda} give more aggressive shrinkage. Under this parameterisation, one-
+Bayesian posterior shrinkage under a Normal prior on log-enrichment with
+prior precision \eqn{\lambda}. Larger values of \code{lambda} give more
+aggressive shrinkage. By default the prior is centred on zero; with
+\code{shrink.to = "mean"} it is centred on each feature's pseudobulk LFC over
+all scored cells, \eqn{S = w \cdot \text{LFC} + (1 - w) \cdot \mu}, so
+that a feature whose null LFC sits away from zero is not pulled toward zero
+by a depth-dependent amount. Under this parameterisation, one-
 sided evidence (e.g. many site insertions and no control insertions) still
 receives non-zero weight scaling with the control window size, since the
 control exposure itself is informative about the absence of insertions.

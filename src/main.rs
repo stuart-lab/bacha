@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 mod bacha;
+use bacha::{FeatureNames, ShrinkTarget};
 // The index builder is WIP
 #[allow(dead_code)]
 mod index;
@@ -114,6 +115,34 @@ enum Commands {
         #[arg(short = 'p', long = "pseudocount", default_value_t = 1.0)]
         pseudocount: f32,
 
+        /// Where shrinkage pulls each score: toward 0, or toward the
+        /// feature's pseudobulk log fold change over all scored cells.
+        #[arg(
+            long = "shrink-to",
+            value_enum,
+            default_value_t = ShrinkTarget::Zero,
+            long_help = "Shrinkage target. `zero` (default) is the posterior mean under a prior \
+                         centred on no enrichment, so every score is pulled toward 0 by \
+                         1 - prec / (prec + lambda). `mean` centres the prior on each feature's \
+                         pseudobulk log2 fold change, computed from the counts summed over every \
+                         scored cell."
+        )]
+        shrink_to: ShrinkTarget,
+
+        /// Label for each feature (row) in the output: its display name or
+        /// its unique ID.
+        #[arg(
+            long = "feature-names",
+            value_enum,
+            default_value_t = FeatureNames::Name,
+            long_help = "Label for each feature (row) in the output. `name` (default) uses the \
+                         display name stored in the index, such as a TF gene symbol; when \
+                         several features share a name, each of them is written as \
+                         `NAME (ID)` so rows stay unique. `id` uses the feature's unique ID, \
+                         such as a JASPAR matrix ID."
+        )]
+        feature_names: FeatureNames,
+
         /// Skip the genome/assembly bounds check that aborts when a fragment
         /// coordinate falls beyond the end of its chromosome in the index.
         #[arg(
@@ -134,6 +163,18 @@ enum Commands {
         /// Print header information only
         #[arg(short = 'H', long = "header-only")]
         header_only: bool,
+    },
+    /// Export the motif matrices stored in an index, in JASPAR format
+    #[command(
+        long_about = "Export the motif matrices stored in an index, in JASPAR format. \
+                            Each record's header line is `>ID<TAB>NAME<TAB>TYPE`, where TYPE is \
+                            the value type of the matrix as given to the index builder: \
+                            counts, probabilities, logodds or other. Features without a \
+                            matrix are left out."
+    )]
+    Motifs {
+        /// Bacha index file
+        index: String,
     },
     /// Print summary information about an index file (header + per-TF site
     /// and control counts) without reading the site position blocks.
@@ -173,6 +214,8 @@ fn run() -> Result<(), Box<dyn Error>> {
             threads,
             lambda,
             pseudocount,
+            shrink_to,
+            feature_names,
             no_bounds_check,
         } => {
             let index_file = canonicalize_input(&index, "index file")?;
@@ -188,6 +231,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                         threads,
                         lambda,
                         pseudocount,
+                        shrink_to,
+                        feature_names,
                         !no_bounds_check,
                     )?;
                 }
@@ -205,6 +250,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                         threads,
                         lambda,
                         pseudocount,
+                        shrink_to,
+                        feature_names,
                         !no_bounds_check,
                     )?;
                 }
@@ -213,6 +260,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         Commands::View { index, header_only } => {
             let index_file = canonicalize_input(&index, "index file")?;
             bacha::view_index(&index_file, header_only)?;
+        }
+        Commands::Motifs { index } => {
+            let index_file = canonicalize_input(&index, "index file")?;
+            let stdout = std::io::stdout();
+            let mut out = std::io::BufWriter::new(stdout.lock());
+            bacha::write_index_motifs(&index_file, &mut out)?;
         }
         Commands::Summary { index } => {
             let index_file = canonicalize_input(&index, "index file")?;

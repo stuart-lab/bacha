@@ -10,12 +10,14 @@ S3method(Bacha,Seurat)
 S3method(Bacha,default)
 export(Bacha)
 export(BachaIndex)
+export(IndexMotifs)
 export(IndexSummary)
 importFrom(BiocGenerics,
   "start<-",
   end,
   sort,
-  start
+  start,
+  unstrand
 )
 importFrom(Biostrings,
   getSeq,
@@ -71,6 +73,10 @@ importFrom(Signac,
 )
 importFrom(data.table,fread)
 importFrom(hdf5r,H5File)
+importFrom(methods,
+  is,
+  slot
+)
 importFrom(motifmatchr,matchMotifs)
 importFrom(stats,
   cov,
@@ -82,6 +88,7 @@ importFrom(stats,
 )
 importFrom(utils,
   head,
+  packageVersion,
   read.table,
   setTxtProgressBar,
   txtProgressBar

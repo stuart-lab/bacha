@@ -1,8 +1,9 @@
 #' Summarise a Bacha index file
 #'
 #' Prints a summary of a Bacha index file: format version, genome and motif
-#' set, window size, number of chromosomes covered, number of TFs, and a
-#' summary of the per-TF number of motif sites. Optionally returns a data
+#' set, window size, how the index was built (date and [BachaIndex()]
+#' parameters), number of chromosomes covered, number of TFs, and a summary
+#' of the per-TF number of motif sites. Optionally returns a data
 #' frame of TF site counts.
 #'
 #' Requires the `bacha` command-line tool to be installed and available on
@@ -13,7 +14,8 @@
 #' @param bacha.path Path to the `bacha` executable. If `NULL`, looks it up
 #'   on the system PATH.
 #' @param return.table Logical. If `TRUE`, invisibly return a data frame
-#'   with columns `tf` and `n_sites` in addition to printing the summary.
+#'   with columns `tf` (feature ID), `name` (display name) and `n_sites` in
+#'   addition to printing the summary.
 #'   Default: `FALSE`.
 #'
 #' @return Invisibly, `NULL` (or a data frame if `return.table = TRUE`).
@@ -42,6 +44,23 @@ IndexSummary <- function(
   # Header metadata: lines starting with "## "
   header_lines <- grep("^##[^\\[]", lines, value = TRUE)
   header_meta <- sub("^##\\s*", "", header_lines)
+
+  # Build provenance: "key\tvalue" lines between "##[build]" and the next
+  # "#" line. Absent when the index records none.
+  build_block <- section_lines(lines = lines, header = "##[build]")
+  build <- sub(pattern = "\t", replacement = ": ", x = build_block, fixed = TRUE)
+
+  # Feature table: "id<TAB>name" lines after the "# id<TAB>name" header
+  features <- section_lines(lines = lines, header = "##[features]")
+  feature_name <- if (length(x = features)) {
+    parts <- strsplit(x = features, split = "\t", fixed = TRUE)
+    setNames(
+      object = vapply(X = parts, FUN = function(p) p[2] %||% p[1], FUN.VALUE = ""),
+      nm = vapply(X = parts, FUN = `[`, FUN.VALUE = "", 1L)
+    )
+  } else {
+    character(0)
+  }
 
   # Chromosome sizes: between "##[chromosome sizes]" and the next "#" line
   chrom_hdr <- grep("^##\\[chromosome sizes\\]", lines)
@@ -74,10 +93,16 @@ IndexSummary <- function(
     text = tf_block, sep = "\t", header = FALSE,
     col.names = c("tf", "idx", "n_sites"), stringsAsFactors = FALSE
   )
+  tf_tab$name <- unname(feature_name[tf_tab$tf])
+  tf_tab$name[is.na(x = tf_tab$name)] <- tf_tab$tf[is.na(x = tf_tab$name)]
 
   # Print summary
   cat("Bacha index:", index, "\n")
   for (m in header_meta) cat("  ", m, "\n", sep = "")
+  if (length(x = build) > 0L) {
+    cat("  build:\n")
+    for (b in build) cat("    ", b, "\n", sep = "")
+  }
   cat("  chromosomes: ", n_chroms, "\n", sep = "")
   cat("  TFs:         ", nrow(tf_tab), "\n", sep = "")
   cat("  motif sites per TF:\n")
@@ -90,14 +115,30 @@ IndexSummary <- function(
   top <- tf_tab[order(-tf_tab$n_sites), ][seq_len(min(5, nrow(tf_tab))), ]
   bot <- tf_tab[order(tf_tab$n_sites), ][seq_len(min(5, nrow(tf_tab))), ]
   cat("  top 5 (most sites): ",
-      paste(sprintf("%s (%d)", top$tf, top$n_sites), collapse = ", "),
+      paste(sprintf("%s (%d)", top$name, top$n_sites), collapse = ", "),
       "\n", sep = "")
   cat("  bottom 5 (fewest): ",
-      paste(sprintf("%s (%d)", bot$tf, bot$n_sites), collapse = ", "),
+      paste(sprintf("%s (%d)", bot$name, bot$n_sites), collapse = ", "),
       "\n", sep = "")
 
   if (return.table) {
-    return(invisible(tf_tab[, c("tf", "n_sites")]))
+    return(invisible(tf_tab[, c("tf", "name", "n_sites")]))
   }
   invisible(NULL)
+}
+
+# Data lines of a "##[name]" section of `bacha view` output, up to the next
+# line starting with "#". Empty if the section is absent.
+section_lines <- function(lines, header) {
+  hdr <- which(lines == header)
+  if (length(x = hdr) != 1L || hdr == length(x = lines)) {
+    return(character(0))
+  }
+  rest <- lines[(hdr + 1L):length(x = lines)]
+  # skip a "# col1<TAB>col2" column header directly under the section header
+  if (startsWith(x = rest[1], prefix = "# ")) {
+    rest <- rest[-1L]
+  }
+  stop_at <- which(startsWith(x = rest, prefix = "#"))
+  if (length(x = stop_at)) rest[seq_len(stop_at[1] - 1L)] else rest
 }
