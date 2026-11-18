@@ -161,7 +161,7 @@ added without changing the format version. \verb{bacha view} and
 \itemize{
 \item For each of the \code{n_tfs} features: a length-prefixed ID string, then a
 length-prefixed display name string. IDs are unique. For PWMs from
-TFBSTools (including \code{\link[Signac:ReadPWM]{Signac::ReadPWM()}}) they are the matrix IDs and the
+TFBSTools (including \code{Signac::ReadPWM()}) they are the matrix IDs and the
 names are the matrix names; otherwise both come from the list names.
 Names may repeat; \verb{bacha count --feature-names} picks which is used to
 label the output.
